@@ -1,6 +1,6 @@
 FROM python:3.12-slim
-LABEL org.opencontainers.image.title="FundingLens AI" \
-      org.opencontainers.image.source="https://github.com/OWNER/REPO"
+LABEL org.opencontainers.image.title="CEDA Innovation Management Portal" \
+      org.opencontainers.image.source="https://github.com/oshealth31/ceda-innovation-management-portal"
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 DATA_DIR=/app/data
 COPY requirements.txt .

@@ -29,6 +29,21 @@ services:
       DEMO_PASSWORD: ${DEMO_PASSWORD:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-}
+      # Accounts, codes, alerts and email/SMS (see .env.example)
+      ALLOW_SELF_REGISTRATION: ${ALLOW_SELF_REGISTRATION:-true}
+      DEMO_SHOW_CODES: ${DEMO_SHOW_CODES:-false}
+      PORTAL_URL: ${PORTAL_URL:-}
+      ALERT_DISPATCH: ${ALERT_DISPATCH:-on}
+      BREVO_API_KEY: ${BREVO_API_KEY:-}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-CEDA Innovation Management Portal}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMS_API_URL: ${SMS_API_URL:-}
+      SMS_API_KEY: ${SMS_API_KEY:-}
+      SMS_SENDER: ${SMS_SENDER:-CEDA}
     ports:
       - "8000:8000"
     volumes:
