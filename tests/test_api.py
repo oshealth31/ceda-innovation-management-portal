@@ -637,7 +637,9 @@ class ApiScenario(unittest.TestCase):
         t = r.json()
         self.assertEqual((t['status'], t['category_label'], t['overdue']), ('open', 'My idea', False))
         self.assertGreater(t['due_at'], t['created_at'])
-        self.assertEqual(self.c.get('/api/support/tickets', headers=self.ids['applicant']).json()['items'], [])  # not theirs
+        self.assertEqual(self.c.post('/api/users', headers=ad, json={'username': 'other.sub', 'password': PW, 'role': 'applicant'}).status_code, 200)
+        other = self.login('other.sub')
+        self.assertEqual(self.c.get('/api/support/tickets', headers=other).json()['items'], [])  # not theirs
         staff = self.c.get('/api/support/tickets', headers=o).json()
         self.assertEqual(staff['stats']['open'], 1)
         self.assertEqual(self.c.post(f"/api/support/tickets/{t['id']}/reply", headers=h, json={'response': 'self'}).status_code, 403)
@@ -646,7 +648,7 @@ class ApiScenario(unittest.TestCase):
         notes = self.c.get('/api/notifications', headers=h).json()
         self.assertTrue(any('PDF under 15 MB' in n['message'] for n in notes))
         self.assertEqual(self.c.get('/api/support/tickets', headers=ad).json()['stats']['answered_on_time'], 1)
-        self.assertEqual(self.c.post(f"/api/support/tickets/{t['id']}/close", headers=self.ids['applicant']).status_code, 404)
+        self.assertEqual(self.c.post(f"/api/support/tickets/{t['id']}/close", headers=other).status_code, 404)
         self.assertEqual(self.c.post(f"/api/support/tickets/{t['id']}/close", headers=h).json()['status'], 'closed')
         self.assertEqual(M.add_working_days(M.datetime(2026, 11, 13, 10), 1).day, 16)  # Friday + 1 working day = Monday
 
