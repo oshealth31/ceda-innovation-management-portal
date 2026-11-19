@@ -591,7 +591,7 @@ const chatTime = (iso) => new Date(iso + (iso && !iso.endsWith('Z') && !iso.incl
 function chatReset() { clearInterval(chat.timer); Object.assign(chat, { open: false, sid: null, after: 0, timer: null, status: null }); const b = $('chatDock'); if (b) b.remove(); }
 function chatInit() {
   chatReset();
-  if (!me || me.chat_agent) return; // consultants use the console page
+  if (!me || me.role !== 'applicant') return; // staff use the Live chat console page instead
   const dock = document.createElement('div'); dock.id = 'chatDock';
   dock.innerHTML = `<button class="chat-fab" data-action="chat-toggle" aria-label="Live chat" aria-expanded="false">${icon('chat')}<span>Chat</span></button>
     <section class="chat-panel hidden" id="chatPanel" aria-label="Live chat"><header><b>Live chat</b><span id="chatState" class="small"></span><button class="chat-x" data-action="chat-toggle" aria-label="Close chat">&times;</button></header><div id="chatBody"></div></section>`;
