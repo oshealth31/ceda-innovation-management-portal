@@ -2519,8 +2519,21 @@ CONTENT_DEFAULTS = {
     'support_email': '',
     'support_phone': '',
     'support_categories': json.dumps(DEFAULT_SUPPORT_CATEGORIES),
+    # Look and feel (1.6). Set these to the institution's brand colours.
+    'portal_name': 'CEDA Innovation Management Portal',
+    'theme_primary': '#1e5eff',   # buttons, links, charts
+    'theme_sidebar': '#10243f',   # menu and headings
 }
-PUBLIC_CONTENT = ('announcement', 'welcome', 'support_intro', 'support_hours', 'support_email', 'support_phone')
+PUBLIC_CONTENT = ('announcement', 'welcome', 'support_intro', 'support_hours', 'support_email', 'support_phone',
+                  'portal_name', 'theme_primary', 'theme_sidebar')
+
+
+def contrast_with_white(hex_colour: str) -> float:
+    """WCAG contrast ratio of white text on this colour (4.5 or more is readable)."""
+    rgb = [int(hex_colour[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+    lin = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in rgb]
+    lum = 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+    return round(1.05 / (lum + 0.05), 2)
 FIELD_KINDS = ('text', 'textarea', 'number', 'select', 'yes_no', 'date', 'url')
 SUPPORT_ROLES = ('admin', 'officer')
 
@@ -2773,6 +2786,15 @@ def set_content(req: dict, u: User = Depends(require_roles('admin')), s: Session
                 raise HTTPException(422, f'{k} is too long (4000 characters at most).')
             if k == 'support_email' and text_v and not MSG.valid_email(text_v):
                 raise HTTPException(422, 'Please enter a valid support email address.')
+            if k in ('theme_primary', 'theme_sidebar'):
+                text_v = text_v.lower()
+                if not re.fullmatch(r'#[0-9a-f]{6}', text_v):
+                    raise HTTPException(422, 'Colours must be 6-digit codes such as #1e5eff.')
+                if contrast_with_white(text_v) < 4.5:
+                    raise HTTPException(422, f'White text on {text_v} would be hard to read (contrast {contrast_with_white(text_v)}:1, '
+                                             'needs 4.5:1). Choose a darker shade.')
+            if k == 'portal_name' and not 3 <= len(text_v) <= 80:
+                raise HTTPException(422, 'The portal name must be 3 to 80 characters.')
             clean[k] = text_v
     rows = {r.key: r for r in s.scalars(select(SiteContent).where(SiteContent.institution_id == u.institution_id)).all()}
     for k, v in clean.items():

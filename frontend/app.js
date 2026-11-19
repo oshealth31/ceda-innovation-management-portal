@@ -32,6 +32,41 @@ const METRICS = [['revenue', 'Revenue', 'm'], ['expenses', 'Expenses', 'm'], ['p
   ['funding', 'Funding requested', 'm'], ['contribution', 'Owner contribution', 'm'], ['funding_to_contribution', 'Funding / contribution', 'x'],
   ['owner_contribution_pct', 'Owner share of cost', 'p'], ['expense_to_revenue_ratio', 'Expense / revenue', 'x']];
 const ORIGIN = { document: 'read from document - unconfirmed', officer_override: 'confirmed by officer', application_form: 'from application form' };
+/* ---------- icons: simple line icons drawn here, so nothing loads from outside ---------- */
+const ICONS = {
+  dashboard: '<rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/>',
+  applications: '<path d="M9 18h6"/><path d="M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7V16h8v-1.3A7 7 0 0 0 12 2z"/>',
+  new: '<circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/>',
+  review: '<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',
+  committee: '<path d="M12 3v18"/><path d="M5 7h14"/><path d="M5 7l-3 7a4 4 0 0 0 6 0z"/><path d="M19 7l-3 7a4 4 0 0 0 6 0z"/>',
+  scoring: '<path d="M12 2l3 6.5 7 .9-5.2 4.8 1.4 7L12 17.8 5.8 21.2l1.4-7L2 9.4l7-.9z"/>',
+  standards: '<path d="M3 5h18M6 12h12M10 19h4"/>',
+  programmes: '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
+  knowledge: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20V3H6.5A2.5 2.5 0 0 0 4 5.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H20v-5"/>',
+  management: '<path d="M3 3v18h18"/><path d="M7 15l4-4 3 3 5-6"/>',
+  reports: '<path d="M18 20V10M12 20V4M6 20v-6"/>',
+  notifications: '<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
+  support: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+  chat: '<path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 9 9 0 0 1-4-.9L3 20l1.1-4A8.4 8.4 0 1 1 21 11.5z"/>',
+  help: '<circle cx="12" cy="12" r="9"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/>',
+  content: '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>',
+  formbuilder: '<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/>',
+  users: '<circle cx="9" cy="8" r="4"/><path d="M2 21v-1a6 6 0 0 1 12 0v1"/><path d="M16 4a4 4 0 0 1 0 8M22 21v-1a6 6 0 0 0-4-5.7"/>',
+  audit: '<path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6z"/><path d="M9 12l2 2 4-4"/>',
+  messages: '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="M22 6l-10 7L2 6"/>',
+  settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
+  download: '<path d="M12 4v11"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/>',
+  print: '<path d="M7 9V4h10v5"/><rect x="4" y="9" width="16" height="8" rx="2"/><path d="M7 14h10v6H7z"/>',
+  logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5M21 12H9"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>',
+  send: '<path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4z"/>',
+  upload: '<path d="M12 20V9"/><path d="m7 14 5-5 5 5"/><path d="M5 4h14"/>',
+};
+const icon = (name) => (ICONS[name] ? `<svg class="ico" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>` : '');
+// Menu sections keep the longer administrator menu easy to scan.
+const NAV_SECTIONS = [['Work', ['dashboard', 'applications', 'new', 'review', 'committee']], ['Insight', ['management', 'reports']],
+  ['Help', ['notifications', 'support', 'chat', 'help']], ['Set-up', ['programmes', 'scoring', 'standards', 'knowledge', 'formbuilder', 'content', 'users']],
+  ['System', ['audit', 'messages', 'settings']]];
 const NAV = [
   ['dashboard', 'Dashboard', ['admin', 'officer', 'committee', 'applicant']],
   ['applications', 'Ideas', ['admin', 'officer', 'committee', 'applicant']],
@@ -103,7 +138,15 @@ async function boot() {
     me = await api('/api/me');
     $('login').classList.add('hidden'); $('portal').classList.remove('hidden');
     $('userInfo').textContent = `${me.username} - ${roleLabel(me.role)} - ${me.institution.name}`;
-    $('nav').innerHTML = NAV.filter((n) => n[2].includes(me.role)).map((n) => `<button class="nav" data-action="nav" data-page="${n[0]}">${esc(n[1])}</button>`).join('');
+    const mine = new Map(NAV.filter((n) => n[2].includes(me.role)).map((n) => [n[0], n]));
+    const btn = (n) => `<button class="nav" data-action="nav" data-page="${n[0]}">${icon(n[0])}<span>${esc(n[1])}</span></button>`;
+    const placed = new Set();
+    let html = NAV_SECTIONS.map(([title, ids]) => {
+      const items = ids.filter((id) => mine.has(id)); items.forEach((id) => placed.add(id));
+      return items.length ? `<div class="nav-section">${esc(title)}</div>${items.map((id) => btn(mine.get(id))).join('')}` : '';
+    }).join('');
+    html += [...mine.values()].filter((n) => !placed.has(n[0])).map(btn).join('');
+    $('nav').innerHTML = html;
     try { const h = await fetch('/api/health'); $('ver').textContent = 'v' + (await h.json()).version; } catch (e) { /* ignore */ }
     await Promise.all([loadSite(), loadFormFields()]);
     show('dashboard');
@@ -216,7 +259,17 @@ function answersHTML(a) {
   const extra = Object.keys(ans).filter((k) => !formFields.some((f) => f.key === k));
   return known.length || extra.length ? `<div class="answers">${known.map((f) => `<p><b>${esc(f.label)}:</b> ${esc(fmt(ans[f.key]))}</p>`).join('')}${extra.map((k) => `<p><b>${esc(k)}:</b> ${esc(fmt(ans[k]))}</p>`).join('')}</div>` : '';
 }
-async function loadSite() { try { site = await (await fetch('/api/public/help')).json(); } catch (e) { site = null; } }
+async function loadSite() { try { site = await (await fetch('/api/public/help')).json(); applyTheme(site.content); } catch (e) { site = null; } }
+function applyTheme(c) {
+  if (!c) return;
+  const root = document.documentElement.style;
+  if (/^#[0-9a-f]{6}$/i.test(c.theme_primary || '')) root.setProperty('--blue', c.theme_primary);
+  if (/^#[0-9a-f]{6}$/i.test(c.theme_sidebar || '')) root.setProperty('--navy', c.theme_sidebar);
+  if (c.portal_name) {
+    document.title = c.portal_name;
+    document.querySelectorAll('.login-card > .brand, .side .brand').forEach((b) => { b.textContent = c.portal_name; });
+  }
+}
 async function loadFormFields() { try { formFields = await api('/api/form-fields'); } catch (e) { formFields = []; } }
 async function pNew() {
   const progs = (await api('/api/programmes')).filter((p) => p.enabled);
@@ -470,13 +523,6 @@ async function pSettings() {
     <div class="field"><label>New password (min 12)</label><input name="new_password" type="password" required minlength="12" autocomplete="new-password"></div></div><button type="submit">Change password</button></form></div>`;
 }
 
-/* ---------- icons (simple line icons, drawn here so nothing loads from outside) ---------- */
-const ICONS = {
-  download: '<path d="M12 4v11"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/>',
-  print: '<path d="M7 9V4h10v5"/><rect x="4" y="9" width="16" height="8" rx="2"/><path d="M7 14h10v6H7z"/>',
-};
-const icon = (name) => (ICONS[name] ? `<svg class="ico" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>` : '');
-
 /* ---------- reports ---------- */
 let reportFilter = { from: '', to: '', programme_id: '' };
 const qs = (o) => new URLSearchParams(Object.entries(o).filter(([, v]) => v)).toString();
@@ -600,6 +646,12 @@ async function pContent() {
     <div class="field"><label>Support email</label><input name="support_email" type="email" value="${esc(c.support_email)}"></div><div class="field"><label>Support phone</label><input name="support_phone" value="${esc(c.support_phone)}"></div></div>
     <div class="field"><label>Support categories and reply times</label><textarea name="support_categories" rows="6" class="mono">${esc(cats)}</textarea><div class="small muted">One per line: <code>key | label | working days to reply</code>. Use 0 for same day. Keys are short words like <code>account</code>.</div></div>
     <button type="submit">Save content</button></form></div>
+    <div class="card"><h2>Look and feel</h2><p class="muted">Set the portal name and colours to match the brand guide. White text must stay readable, so very light colours are refused.</p>
+    <form data-form="theme"><div class="inline-form"><div class="field"><label>Portal name</label><input name="portal_name" required minlength="3" maxlength="80" value="${esc(c.portal_name)}"></div>
+      <div class="field"><label>Main colour (buttons, links, charts)</label><div class="row"><input type="color" name="theme_primary" value="${esc(c.theme_primary)}" data-theme-preview="--blue"><code data-hex-for="theme_primary">${esc(c.theme_primary)}</code></div></div>
+      <div class="field"><label>Menu colour</label><div class="row"><input type="color" name="theme_sidebar" value="${esc(c.theme_sidebar)}" data-theme-preview="--navy"><code data-hex-for="theme_sidebar">${esc(c.theme_sidebar)}</code></div></div></div>
+      <p class="small" id="contrastNote"></p>
+      <div class="row"><button type="submit">Save look and feel</button><button type="button" class="ghost" data-action="theme-reset">Back to default colours</button></div></form></div>
     <div class="card"><h2>Frequently asked questions (${faqs.length})</h2>${faqs.map((f) => `<details class="faq"><summary>${f.published ? '' : pill('hidden') + ' '}${esc(f.category)}: ${esc(f.question)}</summary>${faqForm(f)}</details>`).join('')}
     <details class="faq"><summary><b>+ Add a question</b></summary>${faqForm(null)}</details></div>
     <div class="card"><h2>Contacts (${contacts.length})</h2><p class="small muted">Check phone numbers and addresses before going live: organisations change them from time to time.</p>${contacts.map((x) => `<details class="faq"><summary>${x.published ? '' : pill('hidden') + ' '}${esc(x.name)}</summary>${contactForm(x)}</details>`).join('')}
@@ -682,6 +734,7 @@ const actions = {
   'csv-ideas': async () => downloadCsv('/api/reports/ideas.csv?' + qs(reportFilter), `ceda-ideas-${new Date().toISOString().slice(0, 10)}.csv`),
   'csv-breakdowns': async () => downloadCsv('/api/reports/breakdowns.csv?' + qs(reportFilter), `ceda-report-${new Date().toISOString().slice(0, 10)}.csv`),
   print: async () => window.print(),
+  'theme-reset': async () => { await send('/api/admin/content', { theme_primary: '#1e5eff', theme_sidebar: '#10243f' }, 'PUT'); await loadSite(); toast('Default colours restored'); show('content'); },
   'faq-delete': async (t) => { if (!confirm('Delete this question for good?')) return; await api('/api/faqs/' + t.dataset.id, { method: 'DELETE' }); toast('Deleted'); show('content'); },
   'contact-delete': async (t) => { if (!confirm('Delete this contact for good?')) return; await api('/api/contacts/' + t.dataset.id, { method: 'DELETE' }); toast('Deleted'); show('content'); },
   'audit-verify': async () => { try { const j = await api('/api/audit/verify'); $('chain').textContent = j.ok ? `Chain intact (${j.checked} records)` : `TAMPERING DETECTED at record ${j.first_bad_id}`; $('chain').className = 'small ' + (j.ok ? '' : 'bad'); } catch (e) { toast(e.message); } },
@@ -747,6 +800,7 @@ const forms = {
     });
     await send('/api/admin/content', { ...d, support_categories: cats }, 'PUT'); await loadSite(); toast('Content saved'); show('content');
   },
+  theme: async (f) => { const d = formData(f); await send('/api/admin/content', d, 'PUT'); await loadSite(); toast('Look and feel saved'); show('content'); },
   faq: async (f) => {
     const d = formData(f); const body = { category: d.category, question: d.question, answer: d.answer, sort: Number(d.sort || 100), published: !!d.published };
     await send(f.dataset.id ? '/api/faqs/' + f.dataset.id : '/api/faqs', body, f.dataset.id ? 'PUT' : 'POST'); toast('Saved'); show('content');
@@ -860,5 +914,19 @@ $('loginForm').addEventListener('submit', async (e) => {
     signedIn(d);
   } catch (ex) { authMsg(false, esc(ex.message)); }
 });
+loadSite();
 fetch('/api/auth/options').then((r) => r.json()).then((o) => { if (o.districts) authOpts = o; if (!o.self_registration) $('regLink').classList.add('hidden'); }).catch(() => {});
 boot();
+
+/* live preview of colours while the administrator picks them */
+function contrastWhite(hex) {
+  const lin = [1, 3, 5].map((i) => { const c = parseInt(hex.slice(i, i + 2), 16) / 255; return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; });
+  return 1.05 / (0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2] + 0.05);
+}
+document.addEventListener('input', (e) => {
+  const el = e.target.closest('[data-theme-preview]'); if (!el) return;
+  document.documentElement.style.setProperty(el.dataset.themePreview, el.value);
+  const code = document.querySelector(`[data-hex-for="${el.name}"]`); if (code) code.textContent = el.value;
+  const ratio = contrastWhite(el.value); const note = $('contrastNote');
+  if (note) note.innerHTML = ratio >= 4.5 ? `Readable: contrast ${ratio.toFixed(1)}:1.` : `<b class="bad">Too light: contrast ${ratio.toFixed(1)}:1, needs 4.5:1.</b>`;
+});

@@ -694,6 +694,24 @@ class ApiScenario(unittest.TestCase):
         self.assertEqual(M.reports.age_band(2000, __import__('datetime').date(2026, 6, 1)), '25-29')
         self.assertEqual(M.reports.age_band(None), 'Not stated')
 
+    # ---- 32 look and feel: name and colours set by the administrator, with a readability check
+    def test_32_theme(self):
+        ad = self.ids['admin']
+        h = self.c.get('/api/public/help').json()['content']
+        self.assertEqual((h['theme_primary'], h['theme_sidebar']), ('#1e5eff', '#10243f'))
+        self.assertEqual(self.c.put('/api/admin/content', headers=ad, json={'theme_primary': 'blue'}).status_code, 422)
+        r = self.c.put('/api/admin/content', headers=ad, json={'theme_primary': '#ffcc00'})  # too light for white text
+        self.assertEqual(r.status_code, 422)
+        self.assertIn('contrast', r.json()['detail'])
+        self.assertEqual(self.c.put('/api/admin/content', headers=ad, json={'portal_name': 'X'}).status_code, 422)
+        r = self.c.put('/api/admin/content', headers=ad, json={'theme_primary': '#0B6E4F', 'theme_sidebar': '#123524',
+                                                               'portal_name': 'Innovation Portal'})
+        self.assertEqual(r.status_code, 200, r.text)
+        h = self.c.get('/api/public/help').json()['content']
+        self.assertEqual((h['theme_primary'], h['portal_name']), ('#0b6e4f', 'Innovation Portal'))
+        self.assertGreaterEqual(M.contrast_with_white('#1e5eff'), 4.5)
+        self.assertLess(M.contrast_with_white('#ffcc00'), 4.5)
+
 
 if __name__ == '__main__':
     unittest.main()
