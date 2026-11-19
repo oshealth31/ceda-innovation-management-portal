@@ -15,7 +15,8 @@ sys.path.insert(0, ROOT)
 _tmp = tempfile.mkdtemp(prefix='fl_test_')
 os.environ.update({
     'ENVIRONMENT': 'test', 'JWT_SECRET': 'test-secret-0123456789-0123456789-abcdef', 'ADMIN_PASSWORD': 'Test-admin-password-1',
-    'DATA_DIR': _tmp, 'LOGIN_IP_LIMIT': '10000', 'LOGIN_LIMIT': '8', 'SEED_DEMO': 'false',
+    'DATA_DIR': _tmp, 'LOGIN_IP_LIMIT': '10000', 'LOGIN_LIMIT': '8', 'REGISTER_LIMIT': '50', 'SEED_DEMO': 'false', 'DEMO_SHOW_CODES': 'true',
+    'ALLOW_SELF_REGISTRATION': 'true', 'PORTAL_URL': 'https://portal.example',
     'DATABASE_URL': os.environ.get('TEST_DATABASE_URL') or f"sqlite:///{os.path.join(_tmp, 'test.db')}",
 })
 os.environ.pop('OPENAI_API_KEY', None)
@@ -435,6 +436,220 @@ class ApiScenario(unittest.TestCase):
         version = (Path(__file__).resolve().parents[1] / 'VERSION').read_text().strip()
         self.assertIn(f'styles.css?v={version}', page, 'bump the ?v= in index.html when VERSION changes')
         self.assertIn(f'app.js?v={version}', page, 'bump the ?v= in index.html when VERSION changes')
+    # ---- 23 self-registration: account is locked until the emailed code is confirmed
+    def test_23_register_and_verify(self):
+        body = {'full_name': 'Neo Molefe', 'username': 'neo.m', 'email': 'Neo@Example.com', 'phone': '71 234 567',
+                'password': PW, 'accept_privacy': True}
+        self.assertEqual(self.c.post('/api/auth/register', json={**body, 'accept_privacy': False}).status_code, 422)
+        self.assertEqual(self.c.post('/api/auth/register', json={**body, 'email': 'not-an-email'}).status_code, 422)
+        self.assertEqual(self.c.post('/api/auth/register', json={**body, 'password': 'short'}).status_code, 400)
+        r = self.c.post('/api/auth/register', json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        j = r.json()
+        self.assertEqual(j['sent_to'], 'n***@example.com')
+        code = j['demo_code']
+        self.assertRegex(code, r'^\d{6}$')
+        self.assertEqual(self.c.post('/api/auth/register', json={**body, 'username': 'neo2'}).status_code, 409)  # same email
+        self.assertEqual(self.c.post('/api/auth/register', json={**body, 'email': 'other@example.com'}).status_code, 409)  # same username
+        # cannot sign in yet; a fresh code comes back with the refusal
+        r = self.c.post('/api/token', data={'username': 'neo.m', 'password': PW})
+        self.assertEqual(r.status_code, 403)
+        self.assertTrue(r.json()['verification_required'])
+        code = r.json()['demo_code']  # the earlier code is now void
+        self.assertEqual(self.c.post('/api/auth/verify', json={'identifier': 'neo.m', 'code': '000000' if code != '000000' else '111111'}).status_code, 400)
+        r = self.c.post('/api/auth/verify', json={'identifier': 'neo@example.com', 'code': code})
+        self.assertEqual(r.status_code, 200, r.text)
+        h = {'Authorization': 'Bearer ' + r.json()['access_token']}
+        me = self.c.get('/api/me', headers=h).json()
+        self.assertEqual((me['role'], me['full_name']), ('applicant', 'Neo Molefe'))
+        self.assertEqual(self.c.post('/api/auth/verify', json={'identifier': 'neo.m', 'code': code}).status_code, 400)  # single use
+        p = self.c.get('/api/me/preferences', headers=h).json()
+        self.assertEqual((p['email'], p['phone'], p['email_verified']), ('neo@example.com', '+26771234567', True))
+        self.login('neo@example.com')  # email works as the sign-in name
+        self.ids['neo'] = h
+
+    # ---- 24 forgotten password
+    def test_24_forgot_and_reset(self):
+        same = self.c.post('/api/auth/forgot', json={'identifier': 'nobody-here'}).json()
+        self.assertEqual(same, {'status': 'sent_if_exists'})
+        j = self.c.post('/api/auth/forgot', json={'identifier': 'neo.m'}).json()
+        self.assertEqual(j['status'], 'sent_if_exists')
+        new_pw = 'Brand-new-pass-word-2'
+        self.assertEqual(self.c.post('/api/auth/reset', json={'identifier': 'neo.m', 'code': j['demo_code'], 'new_password': 'short'}).status_code, 400)
+        r = self.c.post('/api/auth/reset', json={'identifier': 'neo.m', 'code': j['demo_code'], 'new_password': new_pw})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self.c.get('/api/me', headers=self.ids['neo']).status_code, 401)  # old sessions end
+        self.assertEqual(self.c.post('/api/token', data={'username': 'neo.m', 'password': PW}).status_code, 401)
+        self.ids['neo'] = self.login('neo.m', new_pw)
+        self.ids['neo_pw'] = new_pw
+        # wrong codes run out
+        j = self.c.post('/api/auth/forgot', json={'identifier': 'neo.m'}).json()
+        wrong = '000000' if j['demo_code'] != '000000' else '111111'
+        for _ in range(M.CODE_MAX_ATTEMPTS):
+            self.c.post('/api/auth/reset', json={'identifier': 'neo.m', 'code': wrong, 'new_password': 'Yet-another-pass-3'})
+        self.assertEqual(self.c.post('/api/auth/reset', json={'identifier': 'neo.m', 'code': j['demo_code'],
+                                                              'new_password': 'Yet-another-pass-3'}).status_code, 400)
+
+    # ---- 25 one-time code at sign-in, and changing email
+    def test_25_login_code_and_email_change(self):
+        h = self.ids['neo']
+        r = self.c.put('/api/me/preferences', headers=h, json={'otp_login': True})
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.c.post('/api/token', data={'username': 'neo.m', 'password': self.ids['neo_pw']})
+        j = r.json()
+        self.assertTrue(j['otp_required'])
+        self.assertNotIn('access_token', j)
+        self.assertEqual(self.c.post('/api/auth/login-code', json={'identifier': 'neo.m', 'code': 'abcdef'}).status_code, 400)
+        r = self.c.post('/api/auth/login-code', json={'identifier': 'neo.m', 'code': j['demo_code']})
+        self.assertEqual(r.status_code, 200, r.text)
+        h = {'Authorization': 'Bearer ' + r.json()['access_token']}
+        self.c.put('/api/me/preferences', headers=h, json={'otp_login': False})
+        # new email only counts once confirmed
+        j = self.c.put('/api/me/preferences', headers=h, json={'email': 'neo.new@example.com'}).json()
+        self.assertEqual((j['email'], j['pending_email']), ('neo@example.com', 'neo.new@example.com'))
+        self.assertEqual(self.c.post('/api/me/email/verify', headers=h, json={'code': j['demo_code']}).json()['email'], 'neo.new@example.com')
+        self.assertEqual(self.c.put('/api/me/preferences', headers=h, json={'email': 'NEO.NEW@example.com'}).status_code, 200)
+        # SMS alerts need a phone number
+        self.assertEqual(self.c.put('/api/me/preferences', headers=h, json={'phone': '', 'alert_sms': True}).status_code, 422)
+        self.assertEqual(self.c.put('/api/me/preferences', headers=h, json={'phone': '+267 71 234 567', 'alert_sms': True}).status_code, 200)
+        self.ids['neo'] = h
+
+    # ---- 26 alerts are queued, delivered (recorded) and visible to the administrator with codes masked
+    def test_26_alerts_and_message_log(self):
+        h, ad, o = self.ids['neo'], self.ids['admin'], self.ids['officer']
+        app_id = self.c.post('/api/applications', headers=h, json={'applicant_name': 'Neo Labs', 'funding_request': 0,
+                                                                    'owner_contribution': 0, **IDEA}).json()['id']
+        self.assertEqual(self.upload(h, app_id).status_code, 200)
+        self.assign(app_id, 'officer1')
+        self.assertEqual(self.decide(o, 'request_information', 'Please add your pilot results.', app_id=app_id).status_code, 200)
+        M.dispatch_outbox()
+        self.assertEqual(self.c.get('/api/admin/messages', headers=h).status_code, 403)
+        log = self.c.get('/api/admin/messages', headers=ad).json()
+        mine = [m for m in log['items'] if m['to'] in ('neo.new@example.com', '+26771234567')]
+        alerts = [m for m in mine if m['kind'] == 'alert']
+        self.assertTrue({'email', 'sms'} <= {m['channel'] for m in alerts}, mine)
+        self.assertTrue(all(m['status'] in ('logged', 'sent') for m in alerts))
+        self.assertTrue(any('https://portal.example' in m['body'] for m in alerts))
+        codes = [m for m in mine if m['kind'] in ('verify', 'reset', 'login', 'email')]
+        self.assertTrue(codes)
+        self.assertTrue(all(not __import__('re').search(r'\b\d{6}\b', m['body']) for m in codes), 'codes must be masked in the log')
+        # switching alerts off stops new ones
+        self.c.put('/api/me/preferences', headers=h, json={'alert_email': False, 'alert_sms': False})
+        before = {m['id'] for m in self.c.get('/api/admin/messages?limit=500', headers=ad).json()['items']}
+        self.assertEqual(self.upload(h, app_id).status_code, 200)
+        self.assertEqual(self.decide(o, 'request_information', 'One more thing please.', app_id=app_id).status_code, 200)
+        M.dispatch_outbox()
+        new = [m for m in self.c.get('/api/admin/messages?limit=500', headers=ad).json()['items'] if m['id'] not in before]
+        self.assertFalse([m for m in new if m['kind'] == 'alert' and m['to'] in ('neo.new@example.com', '+26771234567')], new)
+
+    def test_27_options_and_admin_contact_fields(self):
+        self.assertTrue(self.c.get('/api/auth/options').json()['self_registration'])
+        ad = self.ids['admin']
+        r = self.c.post('/api/users', headers=ad, json={'username': 'eval9', 'password': PW, 'role': 'officer',
+                                                        'full_name': 'Eval Nine', 'email': 'neo.new@example.com'})
+        self.assertEqual(r.status_code, 409)
+        r = self.c.post('/api/users', headers=ad, json={'username': 'eval9', 'password': PW, 'role': 'officer',
+                                                        'full_name': 'Eval Nine', 'email': 'eval9@example.com', 'phone': '72000000'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()['phone'], '+26772000000')
+
+    # ---- 28 public help page: FAQs, regulator contacts and support details, editable by the administrator
+    def test_28_public_help_and_content(self):
+        r = self.c.get('/api/public/help')  # no sign-in needed
+        self.assertEqual(r.status_code, 200)
+        h = r.json()
+        self.assertGreaterEqual(len(h['faqs']), 10)
+        names = ' '.join(c['name'] for c in h['contacts'])
+        for org in ('CIPA', 'BOBS', 'BOCRA', 'BURS', 'NBFIRA', 'CEDA'):
+            self.assertIn(org, names)
+        self.assertTrue(h['support_categories'])
+        ad, o = self.ids['admin'], self.ids['officer']
+        self.assertEqual(self.c.put('/api/admin/content', headers=o, json={'announcement': 'x'}).status_code, 403)
+        self.assertEqual(self.c.put('/api/admin/content', headers=ad, json={'nonsense': 'x'}).status_code, 422)
+        self.assertEqual(self.c.put('/api/admin/content', headers=ad, json={'support_email': 'not-email'}).status_code, 422)
+        bad_cats = [{'key': 'a1', 'label': 'One', 'days': 1}, {'key': 'a1', 'label': 'Two', 'days': 2}]
+        self.assertEqual(self.c.put('/api/admin/content', headers=ad, json={'support_categories': bad_cats}).status_code, 422)
+        cats = [{'key': 'account', 'label': 'Account help', 'days': 1}, {'key': 'idea', 'label': 'My idea', 'days': 2}]
+        r = self.c.put('/api/admin/content', headers=ad, json={'announcement': 'Submissions close on 30 November.',
+                                                               'support_email': 'help@example.com', 'support_categories': cats})
+        self.assertEqual(r.status_code, 200, r.text)
+        h = self.c.get('/api/public/help').json()
+        self.assertEqual(h['content']['announcement'], 'Submissions close on 30 November.')
+        self.assertEqual([c['key'] for c in h['support_categories']], ['account', 'idea'])
+        # FAQ and contact management; unpublished items disappear from the public page
+        f = self.c.post('/api/faqs', headers=ad, json={'category': 'Dates', 'question': 'When does the call close?',
+                                                       'answer': 'On 30 November at 17:00.', 'sort': 1}).json()
+        self.assertEqual(self.c.get('/api/public/help').json()['faqs'][0]['question'], 'When does the call close?')
+        self.c.put(f"/api/faqs/{f['id']}", headers=ad, json={**{k: f[k] for k in ('category', 'question', 'answer', 'sort')}, 'published': False})
+        self.assertNotIn(f['id'], [x['id'] for x in self.c.get('/api/public/help').json()['faqs']])
+        self.assertIn(f['id'], [x['id'] for x in self.c.get('/api/admin/faqs', headers=ad).json()])
+        self.assertEqual(self.c.delete(f"/api/faqs/{f['id']}", headers=ad).status_code, 200)
+        self.assertEqual(self.c.post('/api/contacts', headers=ad, json={'name': 'Test Org', 'website': 'ftp://x'}).status_code, 422)
+        c = self.c.post('/api/contacts', headers=ad, json={'name': 'Test Org', 'phone': '+267 300 0000', 'sort': 0}).json()
+        self.assertEqual(self.c.get('/api/public/help').json()['contacts'][0]['name'], 'Test Org')
+        self.assertEqual(self.c.delete(f"/api/contacts/{c['id']}", headers=ad).status_code, 200)
+
+    # ---- 29 administrator adds questions to the idea form; submitters must answer the required ones
+    def test_29_form_builder(self):
+        ad = self.ids['admin']
+        bad = {'key': 'team_size', 'label': 'Team size', 'kind': 'select', 'options': ['only one']}
+        self.assertEqual(self.c.post('/api/form-fields', headers=ad, json=bad).status_code, 422)
+        self.assertEqual(self.c.post('/api/form-fields', headers=ad, json={'key': 'problem', 'label': 'Clash'}).status_code, 409)
+        self.assertEqual(self.c.post('/api/form-fields', headers=self.ids['officer'], json={'key': 'x1', 'label': 'No'}).status_code, 403)
+        q1 = self.c.post('/api/form-fields', headers=ad, json={'key': 'team_size', 'label': 'Team size', 'kind': 'number',
+                                                              'required': True, 'sort': 1}).json()
+        q2 = self.c.post('/api/form-fields', headers=ad, json={'key': 'district', 'label': 'District', 'kind': 'select',
+                                                              'options': ['Gaborone', 'Francistown', 'Maun'], 'sort': 2}).json()
+        self.c.post('/api/form-fields', headers=ad, json={'key': 'youth_led', 'label': 'Youth-led?', 'kind': 'yes_no', 'sort': 3})
+        self.assertEqual([f['key'] for f in self.c.get('/api/form-fields', headers=self.ids['neo']).json()],
+                         ['team_size', 'district', 'youth_led'])
+        h = self.ids['neo']
+        base = {'applicant_name': 'Neo Labs', 'funding_request': 0, 'owner_contribution': 0, **IDEA}
+        r = self.c.post('/api/applications', headers=h, json=base)
+        self.assertEqual(r.status_code, 422)
+        self.assertIn('Team size', r.json()['detail'])
+        self.assertEqual(self.c.post('/api/applications', headers=h, json={**base, 'answers': {'team_size': 'many'}}).status_code, 422)
+        self.assertEqual(self.c.post('/api/applications', headers=h,
+                                     json={**base, 'answers': {'team_size': 3, 'district': 'Lobatse'}}).status_code, 422)
+        r = self.c.post('/api/applications', headers=h, json={**base, 'answers': {'team_size': '3', 'district': 'Maun',
+                                                                                  'youth_led': 'yes', 'sneaky': 'dropped'}})
+        self.assertEqual(r.status_code, 200, r.text)
+        got = self.c.get(f"/api/applications/{r.json()['id']}", headers=h).json()
+        self.assertEqual(got['answers'], {'team_size': 3.0, 'district': 'Maun', 'youth_led': True})
+        # editing keeps the rules; switching a question off stops asking for it
+        self.assertEqual(self.c.put(f"/api/applications/{r.json()['id']}/idea", headers=h,
+                                    json={**IDEA, 'answers': {'district': 'Maun'}}).status_code, 422)
+        self.assertEqual(self.c.put(f"/api/form-fields/{q1['id']}", headers=ad, json={**{k: q1[k] for k in ('key', 'label', 'kind', 'sort')},
+                                                                                  'required': True, 'enabled': False}).status_code, 200)
+        self.assertEqual(self.c.put(f"/api/applications/{r.json()['id']}/idea", headers=h,
+                                    json={**IDEA, 'answers': {'district': 'Maun'}}).status_code, 200)
+        self.assertEqual(self.c.put(f"/api/form-fields/{q2['id']}", headers=ad, json={'key': 'region', 'label': 'District'}).status_code, 409)
+        self.assertEqual(len(self.c.get('/api/form-fields?include_disabled=true', headers=ad).json()), 3)
+
+    # ---- 30 support requests with reply times
+    def test_30_support_tickets(self):
+        h, ad, o = self.ids['neo'], self.ids['admin'], self.ids['officer']
+        self.assertEqual(self.c.post('/api/support/tickets', headers=h, json={'category': 'nope', 'subject': 'Help',
+                                                                              'message': 'I cannot upload my file.'}).status_code, 422)
+        r = self.c.post('/api/support/tickets', headers=h, json={'category': 'idea', 'subject': 'Upload help',
+                                                                 'message': 'I cannot upload my concept note.'})
+        self.assertEqual(r.status_code, 200, r.text)
+        t = r.json()
+        self.assertEqual((t['status'], t['category_label'], t['overdue']), ('open', 'My idea', False))
+        self.assertGreater(t['due_at'], t['created_at'])
+        self.assertEqual(self.c.get('/api/support/tickets', headers=self.ids['applicant']).json()['items'], [])  # not theirs
+        staff = self.c.get('/api/support/tickets', headers=o).json()
+        self.assertEqual(staff['stats']['open'], 1)
+        self.assertEqual(self.c.post(f"/api/support/tickets/{t['id']}/reply", headers=h, json={'response': 'self'}).status_code, 403)
+        r = self.c.post(f"/api/support/tickets/{t['id']}/reply", headers=ad, json={'response': 'Please try a PDF under 15 MB.'})
+        self.assertEqual(r.json()['status'], 'answered')
+        notes = self.c.get('/api/notifications', headers=h).json()
+        self.assertTrue(any('PDF under 15 MB' in n['message'] for n in notes))
+        self.assertEqual(self.c.get('/api/support/tickets', headers=ad).json()['stats']['answered_on_time'], 1)
+        self.assertEqual(self.c.post(f"/api/support/tickets/{t['id']}/close", headers=self.ids['applicant']).status_code, 404)
+        self.assertEqual(self.c.post(f"/api/support/tickets/{t['id']}/close", headers=h).json()['status'], 'closed')
+        self.assertEqual(M.add_working_days(M.datetime(2026, 11, 13, 10), 1).day, 16)  # Friday + 1 working day = Monday
+
 
 if __name__ == '__main__':
     unittest.main()

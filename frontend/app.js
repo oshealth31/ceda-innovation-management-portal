@@ -10,6 +10,7 @@ const when = (iso) => (iso ? new Date(iso).toLocaleString(undefined, { day: 'num
 
 let token = sessionStorage.getItem('fl_token') || '';
 let me = null, current = null, viewing = null, page = 'dashboard';
+let site = null, formFields = [];
 const listState = { offset: 0, limit: 25, status: '' };
 
 const STATUS = {
@@ -43,8 +44,13 @@ const NAV = [
   ['knowledge', 'Policy Knowledge', ['admin', 'officer', 'committee']],
   ['management', 'Management Dashboard', ['admin', 'officer', 'committee']],
   ['notifications', 'Notifications', ['admin', 'officer', 'committee', 'applicant']],
+  ['support', 'Support', ['admin', 'officer', 'committee', 'applicant']],
+  ['help', 'Help and FAQs', ['admin', 'officer', 'committee', 'applicant']],
+  ['content', 'Site content', ['admin']],
+  ['formbuilder', 'Application form', ['admin']],
   ['users', 'Users', ['admin']],
   ['audit', 'Audit Trail', ['admin']],
+  ['messages', 'Message log', ['admin']],
   ['settings', 'Settings', ['admin', 'officer', 'committee', 'applicant']],
 ];
 const TITLES = Object.fromEntries(NAV.map((n) => [n[0], n[1]]));
@@ -98,6 +104,7 @@ async function boot() {
     $('userInfo').textContent = `${me.username} - ${roleLabel(me.role)} - ${me.institution.name}`;
     $('nav').innerHTML = NAV.filter((n) => n[2].includes(me.role)).map((n) => `<button class="nav" data-action="nav" data-page="${n[0]}">${esc(n[1])}</button>`).join('');
     try { const h = await fetch('/api/health'); $('ver').textContent = 'v' + (await h.json()).version; } catch (e) { /* ignore */ }
+    await Promise.all([loadSite(), loadFormFields()]);
     show('dashboard');
   } catch (e) { /* api() already logged out on 401 */ }
 }
@@ -112,7 +119,7 @@ async function show(id) {
   setMenu(false);
   $('page').innerHTML = '<div class="empty">Loading...</div>';
   try { await ({ dashboard: pDashboard, applications: pApplications, new: pNew, review: pReview, committee: pCommittee, scoring: pScoring, standards: pStandards,
-    programmes: pProgrammes, knowledge: pKnowledge, management: pManagement, notifications: pNotifications, users: pUsers, audit: pAudit, settings: pSettings }[id])(); }
+    programmes: pProgrammes, knowledge: pKnowledge, management: pManagement, notifications: pNotifications, users: pUsers, audit: pAudit, messages: pMessages, settings: pSettings, support: pSupport, help: pHelp, content: pContent, formbuilder: pFormBuilder }[id])(); }
   catch (e) { $('page').innerHTML = `<div class="card bad">${esc(e.message)}</div>`; }
 }
 
@@ -162,7 +169,9 @@ async function pDashboard() {
       <div class="card"><div class="muted">In adjudication</div><div class="stat">${st.refer_committee || 0}</div></div>
       <div class="card"><div class="muted">Awarded / declined</div><div class="stat">${st.approve || 0} / ${st.decline || 0}</div></div></div>`;
   }
-  $('page').innerHTML = `${stats}<div class="card"><div class="row between"><h2>${isStaff() ? 'Recent ideas' : 'My ideas'}</h2><button data-action="nav" data-page="applications">View all</button></div>
+  const c = (site && site.content) || {};
+  const top = `${c.announcement ? `<div class="banner warn"><b>Notice:</b> ${esc(c.announcement)}</div>` : ''}${!isStaff() && c.welcome ? `<div class="card welcome">${esc(c.welcome)}</div>` : ''}`;
+  $('page').innerHTML = `${top}${stats}<div class="card"><div class="row between"><h2>${isStaff() ? 'Recent ideas' : 'My ideas'}</h2><button data-action="nav" data-page="applications">View all</button></div>
     <div class="table-wrap"><table class="table"><thead><tr><th>Idea</th><th>Sector</th><th>Stage</th><th>Status</th><th>${isStaff() ? 'Screening coverage' : ''}</th><th>Last update</th><th></th></tr></thead><tbody>${appRows(list.items)}</tbody></table></div></div>`;
 }
 async function pApplications() {
@@ -183,8 +192,31 @@ function ideaFields(a) {
   return `${IDEA_FIELDS.map(([k, l, kind]) => `<div class="field"><label>${esc(l)} *</label>${kind === 'input'
     ? `<input name="${k}" required maxlength="200" value="${v(k)}">` : `<textarea name="${k}" rows="3" required maxlength="5000">${v(k)}</textarea>`}</div>`).join('')}
     <div class="inline-form"><div class="field"><label>Sector *</label><select name="sector" required>${opt(SECTORS, a && a.sector)}</select></div>
-    <div class="field"><label>Stage *</label><select name="stage" required>${opt(STAGES, a && a.stage)}</select></div></div>`;
+    <div class="field"><label>Stage *</label><select name="stage" required>${opt(STAGES, a && a.stage)}</select></div></div>${extraFields(a)}`;
 }
+function extraFields(a) {
+  const ans = (a && a.answers) || {};
+  return formFields.map((f) => {
+    const n = `x_${esc(f.key)}`; const v = ans[f.key]; const req = f.required ? ' required' : '';
+    const lab = `<label>${esc(f.label)}${f.required ? ' *' : ''}</label>`;
+    const help = f.help ? `<div class="small muted">${esc(f.help)}</div>` : '';
+    let input;
+    if (f.kind === 'textarea') input = `<textarea name="${n}" rows="3" maxlength="5000"${req}>${esc(v ?? '')}</textarea>`;
+    else if (f.kind === 'select') input = `<select name="${n}"${req}><option value="">Choose...</option>${f.options.map((o) => `<option ${v === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
+    else if (f.kind === 'yes_no') input = `<select name="${n}"${req}><option value="">Choose...</option><option value="yes" ${v === true ? 'selected' : ''}>Yes</option><option value="no" ${v === false ? 'selected' : ''}>No</option></select>`;
+    else input = `<input name="${n}" type="${{ number: 'number', date: 'date', url: 'url' }[f.kind] || 'text'}"${f.kind === 'number' ? ' step="any"' : ''} maxlength="500" value="${esc(v ?? '')}"${req}>`;
+    return `<div class="field">${lab}${input}${help}</div>`;
+  }).join('');
+}
+const answersFrom = (d) => Object.fromEntries(Object.entries(d).filter(([k]) => k.startsWith('x_')).map(([k, v]) => [k.slice(2), v]));
+function answersHTML(a) {
+  const ans = a.answers || {}; const known = formFields.filter((f) => f.key in ans);
+  const fmt = (v) => (v === true ? 'Yes' : v === false ? 'No' : String(v));
+  const extra = Object.keys(ans).filter((k) => !formFields.some((f) => f.key === k));
+  return known.length || extra.length ? `<div class="answers">${known.map((f) => `<p><b>${esc(f.label)}:</b> ${esc(fmt(ans[f.key]))}</p>`).join('')}${extra.map((k) => `<p><b>${esc(k)}:</b> ${esc(fmt(ans[k]))}</p>`).join('')}</div>` : '';
+}
+async function loadSite() { try { site = await (await fetch('/api/public/help')).json(); } catch (e) { site = null; } }
+async function loadFormFields() { try { formFields = await api('/api/form-fields'); } catch (e) { formFields = []; } }
 async function pNew() {
   const progs = (await api('/api/programmes')).filter((p) => p.enabled);
   $('page').innerHTML = `<div class="card"><h2>Submit an innovative idea</h2><p class="muted">Fields marked * are required. After saving, upload a short document describing your idea (PDF, DOCX or TXT) to submit it for review.</p>
@@ -209,7 +241,7 @@ async function timelineCard(id) {
 }
 function ideaCard(a) {
   return `<div class="card"><h3>The idea</h3><div class="small muted">${esc(a.sector || '-')} - ${esc(a.stage || '-')}</div>
-    <p><b>Problem:</b> ${esc(a.problem || '-')}</p><p><b>Solution:</b> ${esc(a.solution || '-')}</p><p><b>Target users:</b> ${esc(a.target_users || '-')}</p></div>`;
+    <p><b>Problem:</b> ${esc(a.problem || '-')}</p><p><b>Solution:</b> ${esc(a.solution || '-')}</p><p><b>Target users:</b> ${esc(a.target_users || '-')}</p>${answersHTML(a)}</div>`;
 }
 async function openApp(id) { viewing = null; current = await api('/api/applications/' + id); await show('review'); }
 async function pReview() {
@@ -393,6 +425,8 @@ async function pUsers() {
   $('page').innerHTML = `<div class="card"><h2>Users</h2><div class="table-wrap"><table class="table"><thead><tr><th>Username</th><th>Role</th><th>Status</th><th>Created</th><th></th></tr></thead><tbody>${rows.map((u) => `<tr><td>${esc(u.username)}</td><td>${esc(roleLabel(u.role))}</td><td>${u.active ? pill('active', 'good') : pill('inactive', 'bad')}</td><td>${esc(when(u.created_at))}</td>
     <td>${u.id === me.id ? '' : `<button class="small ghost" data-action="user-toggle" data-id="${u.id}" data-active="${u.active ? 1 : 0}">${u.active ? 'Deactivate' : 'Activate'}</button> <button class="small ghost" data-action="user-reset" data-id="${u.id}">Reset password</button>`}</td></tr>`).join('')}</tbody></table></div></div>
     <div class="card"><h3>Create user</h3><form data-form="user-create"><div class="inline-form"><div class="field"><label>Username</label><input name="username" required minlength="3" pattern="[A-Za-z0-9_.\\-]+"></div>
+    <div class="field"><label>Full name</label><input name="full_name" maxlength="200"></div>
+    <div class="field"><label>Email</label><input name="email" type="email"></div><div class="field"><label>Mobile</label><input name="phone" type="tel"></div>
     <div class="field"><label>Temporary password (min 12)</label><input name="password" type="password" required minlength="12" autocomplete="new-password"></div>
     <div class="field"><label>Role</label><select name="role"><option value="officer">Evaluator</option><option value="committee">Adjudicator</option><option value="applicant">Submitter</option><option value="admin">Administrator</option></select></div></div>
     <p class="small muted">Evaluators score assigned ideas and refer them to adjudication. Adjudicators make the final decision and cannot decide an idea they referred. Submitters see only their own ideas.</p><button type="submit">Create user</button></form></div>`;
@@ -402,6 +436,14 @@ async function pAudit() {
   $('page').innerHTML = `<div class="card"><div class="row between"><h2>Audit trail</h2><div class="row"><span id="chain" class="small muted"></span><button class="ghost" data-action="audit-verify">Verify integrity</button></div></div>
     <div class="table-wrap"><table class="table"><thead><tr><th>Time</th><th>User</th><th>Action</th><th>Entity</th><th>Detail</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${esc(when(x.created_at))}</td><td>${esc(x.user)}</td><td>${esc(x.action)}</td><td>${esc(x.entity_type)} / ${esc(String(x.entity_id).slice(0, 8))}</td><td class="small">${esc(x.detail)}</td></tr>`).join('')}</tbody></table></div></div>`;
 }
+async function pMessages() {
+  const j = await api('/api/admin/messages?limit=200');
+  const ch = (c) => (c === 'log' ? 'not configured - recorded here only' : c);
+  const c = j.counts;
+  $('page').innerHTML = `<div class="card"><h2>Message log</h2><p class="muted">Every email and SMS the portal sends: sign-up codes, password resets, sign-in codes and alerts. Codes are masked.</p>
+    <div class="row">${pill('Email: ' + ch(j.channels.email))} ${pill('SMS: ' + ch(j.channels.sms))} ${pill(`Sent ${c.sent || 0}`, 'good')} ${pill(`Recorded ${c.logged || 0}`)} ${pill(`Waiting ${c.queued || 0}`, 'warn')} ${pill(`Failed ${c.failed || 0}`, 'bad')}</div>
+    ${j.items.length ? `<div class="table-wrap"><table class="table"><thead><tr><th>Time</th><th>Channel</th><th>Type</th><th>To</th><th>Subject / message</th><th>Status</th></tr></thead><tbody>${j.items.map((m) => `<tr><td>${esc(when(m.created_at))}</td><td>${esc(m.channel)}</td><td>${esc(m.kind)}</td><td>${esc(m.to)}</td><td class="small"><b>${esc(m.subject || '')}</b> ${esc(m.body)}</td><td>${pill(m.status, { sent: 'good', failed: 'bad', queued: 'warn' }[m.status] || '')}${m.detail ? `<div class="small muted">${esc(m.detail)}</div>` : ''}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty">No messages yet.</div>'}</div>`;
+}
 async function pSettings() {
   let ai = '';
   if (me.role === 'admin') {
@@ -409,8 +451,110 @@ async function pSettings() {
     ai = `<div class="card"><h3>AI assistance</h3><p class="muted">When on, the business-plan text (e-mail addresses and phone numbers removed) is sent to the configured AI provider to draft commentary. Numbers and rubric results never depend on it. ${i.ai_configured ? `Provider configured (${esc(i.ai_model)}).` : '<b>No provider is configured on the server</b>, so rules only will be used.'}</p>
       <label><input id="aiToggle" type="checkbox" data-change="ai" ${i.ai_enabled ? 'checked' : ''}> Allow AI assistance for ${esc(i.name)}</label></div>`;
   }
-  $('page').innerHTML = `${ai}<div class="card"><h3>Change password</h3><form data-form="pw"><div class="inline-form"><div class="field"><label>Current password</label><input name="current_password" type="password" required autocomplete="current-password"></div>
+  const p = await api('/api/me/preferences');
+  const off = (on) => (on ? '' : ' <span class="small muted">(not set up on this server yet: messages are recorded in the log only)</span>');
+  const contact = `<div class="card"><h3>Contact details and alerts</h3>
+    <form data-form="prefs"><div class="inline-form"><div class="field"><label>Full name</label><input name="full_name" value="${esc(p.full_name || '')}" maxlength="200"></div>
+    <div class="field"><label>Email ${p.email ? (p.email_verified ? pill('confirmed', 'good') : pill('not confirmed', 'warn')) : ''}</label><input name="email" type="email" value="${esc(p.email || '')}" autocomplete="email"></div>
+    <div class="field"><label>Mobile number</label><input name="phone" type="tel" value="${esc(p.phone || '')}" placeholder="71 234 567" autocomplete="tel"></div></div>
+    <p class="small muted">Free alerts tell you when an idea you follow changes status or needs something from you.</p>
+    <label><input type="checkbox" name="alert_email" ${p.alert_email ? 'checked' : ''}> Email me alerts${off(p.channels.email)}</label><br>
+    <label><input type="checkbox" name="alert_sms" ${p.alert_sms ? 'checked' : ''}> SMS me alerts${off(p.channels.sms)}</label><br>
+    <label><input type="checkbox" name="otp_login" ${p.otp_login ? 'checked' : ''}> Ask for a one-time code from my email each time I sign in</label>
+    <div><button type="submit">Save</button></div></form>
+    ${p.pending_email ? `<form data-form="email-verify" class="inline-form"><div class="field"><label>Code sent to ${esc(p.pending_email)}</label><input name="code" inputmode="numeric" maxlength="6" required class="code-input"></div><button type="submit">Confirm new email</button></form>` : ''}</div>`;
+  $('page').innerHTML = `${ai}${contact}<div class="card"><h3>Change password</h3><form data-form="pw"><div class="inline-form"><div class="field"><label>Current password</label><input name="current_password" type="password" required autocomplete="current-password"></div>
     <div class="field"><label>New password (min 12)</label><input name="new_password" type="password" required minlength="12" autocomplete="new-password"></div></div><button type="submit">Change password</button></form></div>`;
+}
+
+/* ---------- help, support, site content, application form ---------- */
+const telLink = (p) => String(p || '').split(' / ').map((x) => (/^[+\d][\d\s]+$/.test(x.trim()) ? `<a href="tel:${x.replace(/[^\d+]/g, '')}">${esc(x)}</a>` : esc(x))).join(' / ');
+function helpHTML(h, inPortal) {
+  const c = h.content || {};
+  const groups = {};
+  h.faqs.forEach((f) => { (groups[f.category] = groups[f.category] || []).push(f); });
+  const faqs = Object.entries(groups).map(([cat, items]) => `<h3>${esc(cat)}</h3>${items.map((f) => `<details class="faq"><summary>${esc(f.question)}</summary><p>${esc(f.answer)}</p></details>`).join('')}`).join('');
+  const contacts = h.contacts.map((x) => `<div class="contact"><b>${esc(x.name)}</b><div class="small muted">${esc(x.purpose)}</div>
+    <div class="small">${x.phone ? `Phone: ${telLink(x.phone)}<br>` : ''}${x.email ? `Email: <a href="mailto:${esc(x.email)}">${esc(x.email)}</a><br>` : ''}${x.website ? `<a href="${esc(x.website)}" target="_blank" rel="noopener">${esc(x.website.replace(/^https?:\/\//, ''))}</a><br>` : ''}${x.address ? esc(x.address) : ''}</div></div>`).join('');
+  const reach = [c.support_email && `Email <a href="mailto:${esc(c.support_email)}">${esc(c.support_email)}</a>`, c.support_phone && `call ${telLink(c.support_phone)}`].filter(Boolean).join(' or ');
+  return `<div class="card"><h2>Help and frequently asked questions</h2><p class="muted">${esc(c.support_intro)}</p>
+    <p class="small"><b>Support hours:</b> ${esc(c.support_hours)}${reach ? ` &middot; ${reach}` : ''}</p>
+    ${inPortal ? '<button data-action="nav" data-page="support">Ask a question</button>' : '<p class="small muted">Sign in to send a question to the support team.</p>'}</div>
+    <div class="card">${faqs || '<div class="empty">No questions yet.</div>'}</div>
+    <div class="card"><h2>Useful contacts</h2><p class="small muted">Regulators and partners you may need while turning an idea into a business.</p><div class="contacts">${contacts}</div></div>`;
+}
+async function pHelp() { await loadSite(); $('page').innerHTML = site ? helpHTML(site, true) : '<div class="card empty">Help is not available right now.</div>'; }
+
+const TICKET_STATUS = { open: ['Waiting for reply', 'warn'], answered: ['Answered', 'good'], closed: ['Closed', ''] };
+function ticketHTML(t, staff) {
+  const st = TICKET_STATUS[t.status] || [t.status, ''];
+  return `<div class="finding ${t.overdue ? 'high' : ''}"><div class="row between"><b>${esc(t.subject)}</b><span>${pill(st[0], st[1])} ${t.overdue ? pill('overdue', 'bad') : ''}</span></div>
+    <div class="small muted">${esc(t.category_label)}${staff ? ` &middot; from ${esc(t.user)}` : ''} &middot; sent ${esc(when(t.created_at))} &middot; reply due by ${esc(when(t.due_at))}</div>
+    <p>${esc(t.message)}</p>
+    ${t.response ? `<div class="quote"><b>Reply${t.responded_by ? ' from ' + esc(t.responded_by) : ''}</b> <span class="small muted">${esc(when(t.responded_at))}</span><p>${esc(t.response)}</p></div>` : ''}
+    ${staff && t.status !== 'closed' ? `<form data-form="ticket-reply" data-id="${esc(t.id)}"><div class="field"><label>Your reply</label><textarea name="response" rows="2" required minlength="2" maxlength="5000">${esc(t.response)}</textarea></div><button type="submit" class="small">${t.response ? 'Update reply' : 'Send reply'}</button> <button type="button" class="small ghost" data-action="ticket-close" data-id="${esc(t.id)}">Close</button></form>` : ''}
+    ${!staff && t.status !== 'closed' ? `<button class="small ghost" data-action="ticket-close" data-id="${esc(t.id)}">${t.status === 'answered' ? 'That solved it - close' : 'Withdraw'}</button>` : ''}</div>`;
+}
+async function pSupport() {
+  const [d] = await Promise.all([api('/api/support/tickets'), site ? null : loadSite()]);
+  const staff = !!d.stats; const c = (site && site.content) || {};
+  const days = (n) => (n ? `${n} working day${n === 1 ? '' : 's'}` : 'Same day');
+  const times = `<div class="table-wrap"><table class="table"><thead><tr><th>What your question is about</th><th>We reply within</th></tr></thead><tbody>${d.categories.map((x) => `<tr><td>${esc(x.label)}</td><td>${esc(days(x.days))}</td></tr>`).join('')}</tbody></table></div>`;
+  const stats = staff ? `<div class="grid"><div class="card"><div class="muted">Waiting for reply</div><div class="stat">${d.stats.open}</div></div><div class="card"><div class="muted">Overdue</div><div class="stat ${d.stats.overdue ? 'bad' : ''}">${d.stats.overdue}</div></div><div class="card"><div class="muted">Answered on time</div><div class="stat">${d.stats.answered ? Math.round((100 * d.stats.answered_on_time) / d.stats.answered) + '%' : '-'}</div></div></div>` : '';
+  const form = `<div class="card"><h3>Ask a question</h3><form data-form="ticket"><div class="inline-form"><div class="field"><label>What is it about?</label><select name="category" required><option value="">Choose...</option>${d.categories.map((x) => `<option value="${esc(x.key)}">${esc(x.label)} (${esc(days(x.days))})</option>`).join('')}</select></div>
+    <div class="field"><label>Subject</label><input name="subject" required minlength="3" maxlength="200"></div></div>
+    <div class="field"><label>Your question</label><textarea name="message" rows="4" required minlength="10" maxlength="5000"></textarea></div><button type="submit">Send</button></form></div>`;
+  $('page').innerHTML = `${stats}<div class="card"><h2>Support</h2><p class="muted">${esc(c.support_intro || '')}</p><p class="small"><b>Support hours:</b> ${esc(c.support_hours || '')}</p>${times}
+    <p class="small"><a href="#" data-action="nav" data-page="help">Read the frequently asked questions</a></p></div>
+    ${staff ? '' : form}<div class="card"><h3>${staff ? 'Support requests' : 'My questions'}</h3>${d.items.map((t) => ticketHTML(t, staff)).join('') || '<div class="empty">No questions yet.</div>'}</div>${staff ? form : ''}`;
+}
+
+async function pContent() {
+  const [c, faqs, contacts] = await Promise.all([api('/api/admin/content'), api('/api/admin/faqs'), api('/api/admin/contacts')]);
+  const cats = JSON.parse(c.support_categories || '[]').map((x) => `${x.key} | ${x.label} | ${x.days}`).join('\n');
+  const t = (name, label, rows, help) => `<div class="field"><label>${label}</label><textarea name="${name}" rows="${rows}" maxlength="4000">${esc(c[name])}</textarea>${help ? `<div class="small muted">${help}</div>` : ''}</div>`;
+  const faqForm = (f) => `<form data-form="faq" ${f ? `data-id="${esc(f.id)}"` : ''}><div class="inline-form"><div class="field"><label>Group</label><input name="category" required maxlength="80" value="${esc(f ? f.category : 'General')}"></div>
+    <div class="field"><label>Order</label><input name="sort" type="number" min="0" max="10000" value="${f ? f.sort : 100}"></div></div>
+    <div class="field"><label>Question</label><input name="question" required minlength="5" maxlength="300" value="${esc(f ? f.question : '')}"></div>
+    <div class="field"><label>Answer</label><textarea name="answer" rows="3" required minlength="5" maxlength="5000">${esc(f ? f.answer : '')}</textarea></div>
+    <label><input type="checkbox" name="published" ${!f || f.published ? 'checked' : ''}> Show on the help page</label>
+    <div class="row"><button type="submit" class="small">${f ? 'Save' : 'Add question'}</button>${f ? `<button type="button" class="small ghost" data-action="faq-delete" data-id="${esc(f.id)}">Delete</button>` : ''}</div></form>`;
+  const contactForm = (x) => `<form data-form="contact" ${x ? `data-id="${esc(x.id)}"` : ''}><div class="inline-form"><div class="field"><label>Organisation</label><input name="name" required minlength="2" maxlength="200" value="${esc(x ? x.name : '')}"></div>
+    <div class="field"><label>Order</label><input name="sort" type="number" min="0" max="10000" value="${x ? x.sort : 100}"></div></div>
+    <div class="field"><label>What they help with</label><input name="purpose" maxlength="1000" value="${esc(x ? x.purpose : '')}"></div>
+    <div class="inline-form"><div class="field"><label>Phone</label><input name="phone" maxlength="120" value="${esc(x ? x.phone : '')}"></div><div class="field"><label>Email</label><input name="email" type="email" maxlength="200" value="${esc(x ? x.email : '')}"></div></div>
+    <div class="inline-form"><div class="field"><label>Website</label><input name="website" type="url" maxlength="200" value="${esc(x ? x.website : '')}"></div><div class="field"><label>Address</label><input name="address" maxlength="300" value="${esc(x ? x.address : '')}"></div></div>
+    <label><input type="checkbox" name="published" ${!x || x.published ? 'checked' : ''}> Show on the help page</label>
+    <div class="row"><button type="submit" class="small">${x ? 'Save' : 'Add contact'}</button>${x ? `<button type="button" class="small ghost" data-action="contact-delete" data-id="${esc(x.id)}">Delete</button>` : ''}</div></form>`;
+  $('page').innerHTML = `<div class="card"><h2>Site content</h2><p class="muted">Change the wording people see, without a new release. Changes show straight away and are recorded in the audit trail.</p>
+    <form data-form="content">${t('announcement', 'Announcement (shown at the top of everyone’s dashboard; leave empty to hide)', 2)}${t('welcome', 'Welcome message for submitters', 3)}
+    ${t('support_intro', 'Help page introduction', 3)}<div class="inline-form"><div class="field"><label>Support hours</label><input name="support_hours" maxlength="300" value="${esc(c.support_hours)}"></div>
+    <div class="field"><label>Support email</label><input name="support_email" type="email" value="${esc(c.support_email)}"></div><div class="field"><label>Support phone</label><input name="support_phone" value="${esc(c.support_phone)}"></div></div>
+    <div class="field"><label>Support categories and reply times</label><textarea name="support_categories" rows="6" class="mono">${esc(cats)}</textarea><div class="small muted">One per line: <code>key | label | working days to reply</code>. Use 0 for same day. Keys are short words like <code>account</code>.</div></div>
+    <button type="submit">Save content</button></form></div>
+    <div class="card"><h2>Frequently asked questions (${faqs.length})</h2>${faqs.map((f) => `<details class="faq"><summary>${f.published ? '' : pill('hidden') + ' '}${esc(f.category)}: ${esc(f.question)}</summary>${faqForm(f)}</details>`).join('')}
+    <details class="faq"><summary><b>+ Add a question</b></summary>${faqForm(null)}</details></div>
+    <div class="card"><h2>Contacts (${contacts.length})</h2><p class="small muted">Check phone numbers and addresses before going live: organisations change them from time to time.</p>${contacts.map((x) => `<details class="faq"><summary>${x.published ? '' : pill('hidden') + ' '}${esc(x.name)}</summary>${contactForm(x)}</details>`).join('')}
+    <details class="faq"><summary><b>+ Add a contact</b></summary>${contactForm(null)}</details></div>`;
+}
+
+const KIND_LABEL = { text: 'Short answer', textarea: 'Long answer', number: 'Number', select: 'Choose one', yes_no: 'Yes / No', date: 'Date', url: 'Web link' };
+async function pFormBuilder() {
+  const rows = await api('/api/form-fields?include_disabled=true');
+  const fieldForm = (f) => `<form data-form="field" ${f ? `data-id="${esc(f.id)}"` : ''}><div class="inline-form">
+    <div class="field"><label>Question</label><input name="label" required minlength="2" maxlength="200" value="${esc(f ? f.label : '')}"></div>
+    <div class="field"><label>Key ${f ? '(cannot change)' : '(short, e.g. team_size)'}</label><input name="key" required pattern="[a-z][a-z0-9_]*" maxlength="60" value="${esc(f ? f.key : '')}" ${f ? 'readonly' : ''}></div>
+    <div class="field"><label>Type</label><select name="kind">${Object.entries(KIND_LABEL).map(([k, l]) => `<option value="${k}" ${f && f.kind === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+    <div class="field"><label>Order</label><input name="sort" type="number" min="0" max="10000" value="${f ? f.sort : 100}"></div></div>
+    <div class="field"><label>Choices (for "Choose one": one per line)</label><textarea name="options" rows="3">${esc(f ? f.options.join('\n') : '')}</textarea></div>
+    <div class="field"><label>Help text</label><input name="help" maxlength="1000" value="${esc(f ? f.help : '')}"></div>
+    <label><input type="checkbox" name="required" ${f && f.required ? 'checked' : ''}> Required</label> &nbsp; <label><input type="checkbox" name="enabled" ${!f || f.enabled ? 'checked' : ''}> Shown on the form</label>
+    <div><button type="submit" class="small">${f ? 'Save question' : 'Add question'}</button></div></form>`;
+  $('page').innerHTML = `<div class="card"><h2>Application form</h2><p class="muted">Every idea form asks for the title, problem, solution, target users, sector and stage. Add your own questions here; they appear on the form straight away. Questions cannot be deleted, so answers already given are kept. Hide a question instead.</p>
+    ${rows.length ? `<div class="table-wrap"><table class="table"><thead><tr><th>Order</th><th>Question</th><th>Type</th><th>Required</th><th>Shown</th></tr></thead><tbody>${rows.map((f) => `<tr><td>${f.sort}</td><td>${esc(f.label)}<div class="small muted">${esc(f.key)}</div></td><td>${esc(KIND_LABEL[f.kind] || f.kind)}${f.kind === 'select' ? `<div class="small muted">${esc(f.options.join(', '))}</div>` : ''}</td><td>${f.required ? 'Yes' : 'No'}</td><td>${f.enabled ? pill('shown', 'good') : pill('hidden')}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty">No extra questions yet.</div>'}</div>
+    ${rows.map((f) => `<details class="card faq"><summary>Edit: ${esc(f.label)}</summary>${fieldForm(f)}</details>`).join('')}
+    <div class="card"><h3>Add a question</h3>${fieldForm(null)}</div>
+    <div class="card"><h3>Preview of the extra questions</h3><p class="small muted">This is how submitters see them, below the standard fields.</p>${formFields.length ? extraFields(null) : '<div class="empty">Nothing to preview yet.</div>'}</div>`;
 }
 
 /* ---------- actions ---------- */
@@ -466,18 +610,21 @@ const actions = {
     try { await send('/api/users/' + t.dataset.id, { password: pw }, 'PATCH'); toast('Password reset'); } catch (e) { toast(e.message); }
   },
   'notif-read': async (t) => { try { await api(`/api/notifications/${t.dataset.id}/read`, { method: 'POST' }); show('notifications'); } catch (e) { toast(e.message); } },
+  'ticket-close': async (t) => { if (!confirm('Close this request?')) return; await api(`/api/support/tickets/${t.dataset.id}/close`, { method: 'POST' }); toast('Closed'); show('support'); },
+  'faq-delete': async (t) => { if (!confirm('Delete this question for good?')) return; await api('/api/faqs/' + t.dataset.id, { method: 'DELETE' }); toast('Deleted'); show('content'); },
+  'contact-delete': async (t) => { if (!confirm('Delete this contact for good?')) return; await api('/api/contacts/' + t.dataset.id, { method: 'DELETE' }); toast('Deleted'); show('content'); },
   'audit-verify': async () => { try { const j = await api('/api/audit/verify'); $('chain').textContent = j.ok ? `Chain intact (${j.checked} records)` : `TAMPERING DETECTED at record ${j.first_bad_id}`; $('chain').className = 'small ' + (j.ok ? '' : 'bad'); } catch (e) { toast(e.message); } },
 };
 const forms = {
   'create-app': async (f) => {
     const d = formData(f);
     const j = await send('/api/applications', { applicant_name: d.applicant_name, funding_request: Number(d.funding_request || 0), owner_contribution: Number(d.owner_contribution || 0), programme_id: d.programme_id || null,
-      idea_title: d.idea_title, problem: d.problem, solution: d.solution, target_users: d.target_users, sector: d.sector, stage: d.stage });
+      idea_title: d.idea_title, problem: d.problem, solution: d.solution, target_users: d.target_users, sector: d.sector, stage: d.stage, answers: answersFrom(d) });
     toast('Idea saved - now upload your document to submit'); await openApp(j.id);
   },
   'idea-edit': async (f) => {
     const d = formData(f);
-    await send(`/api/applications/${current.id}/idea`, { idea_title: d.idea_title, problem: d.problem, solution: d.solution, target_users: d.target_users, sector: d.sector, stage: d.stage }, 'PUT');
+    await send(`/api/applications/${current.id}/idea`, { idea_title: d.idea_title, problem: d.problem, solution: d.solution, target_users: d.target_users, sector: d.sector, stage: d.stage, answers: answersFrom(d) }, 'PUT');
     toast('Idea updated'); show('review');
   },
   assign: async (f) => {
@@ -509,6 +656,36 @@ const forms = {
   },
   knowledge: async (f) => { await send('/api/knowledge', { ...formData(f), category: 'policy', version: '1.0', active: true }); toast('Item added'); show('knowledge'); },
   'user-create': async (f) => { await send('/api/users', formData(f)); toast('User created'); show('users'); },
+  prefs: async (f) => {
+    const d = formData(f);
+    const j = await send('/api/me/preferences', { full_name: d.full_name, email: d.email, phone: d.phone, alert_email: !!d.alert_email, alert_sms: !!d.alert_sms, otp_login: !!d.otp_login }, 'PUT');
+    toast(j.sent_to ? `Saved. We sent a code to ${j.sent_to} to confirm the new address.${j.demo_code ? ' Demo code: ' + j.demo_code : ''}` : 'Saved'); show('settings');
+  },
+  'email-verify': async (f) => { await send('/api/me/email/verify', formData(f)); toast('Email address confirmed'); show('settings'); },
+  ticket: async (f) => { await send('/api/support/tickets', formData(f)); toast('Sent. We will reply within the time shown.'); show('support'); },
+  'ticket-reply': async (f) => { await send(`/api/support/tickets/${f.dataset.id}/reply`, formData(f)); toast('Reply sent'); show('support'); },
+  content: async (f) => {
+    const d = formData(f);
+    const cats = d.support_categories.split('\n').map((l) => l.trim()).filter(Boolean).map((l) => {
+      const p = l.split('|').map((x) => x.trim());
+      if (p.length !== 3 || !/^\d+$/.test(p[2])) throw new Error(`Check this line: "${l}". Use key | label | days.`);
+      return { key: p[0], label: p[1], days: Number(p[2]) };
+    });
+    await send('/api/admin/content', { ...d, support_categories: cats }, 'PUT'); await loadSite(); toast('Content saved'); show('content');
+  },
+  faq: async (f) => {
+    const d = formData(f); const body = { category: d.category, question: d.question, answer: d.answer, sort: Number(d.sort || 100), published: !!d.published };
+    await send(f.dataset.id ? '/api/faqs/' + f.dataset.id : '/api/faqs', body, f.dataset.id ? 'PUT' : 'POST'); toast('Saved'); show('content');
+  },
+  contact: async (f) => {
+    const d = formData(f); const body = { ...d, sort: Number(d.sort || 100), published: !!d.published };
+    await send(f.dataset.id ? '/api/contacts/' + f.dataset.id : '/api/contacts', body, f.dataset.id ? 'PUT' : 'POST'); toast('Saved'); show('content');
+  },
+  field: async (f) => {
+    const d = formData(f);
+    const body = { key: d.key, label: d.label, help: d.help || '', kind: d.kind, options: (d.options || '').split('\n').map((x) => x.trim()).filter(Boolean), required: !!d.required, enabled: !!d.enabled, sort: Number(d.sort || 100) };
+    await send(f.dataset.id ? '/api/form-fields/' + f.dataset.id : '/api/form-fields', body, f.dataset.id ? 'PUT' : 'POST'); await loadFormFields(); toast('Question saved'); show('formbuilder');
+  },
   pw: async (f) => { const j = await send('/api/me/password', formData(f)); token = j.access_token; sessionStorage.setItem('fl_token', token); toast('Password changed'); f.reset(); },
 };
 const changes = {
@@ -523,14 +700,84 @@ document.addEventListener('submit', (e) => {
   e.preventDefault(); const btn = f.querySelector('button[type=submit]'); busy(btn, true);
   Promise.resolve(forms[f.dataset.form](f)).catch((err) => toast(err.message)).finally(() => busy(btn, false));
 });
+/* ---------- sign-in, sign-up, codes ---------- */
+const auth = { who: '' };
+const authMsg = (ok, text) => {
+  $('loginError').classList.add('hidden'); $('loginOk').classList.add('hidden');
+  if (text) { const el = ok ? $('loginOk') : $('loginError'); el.innerHTML = text; el.classList.remove('hidden'); }
+};
+const sentLine = (j, what) => `${what}${j.sent_to ? ` We sent a 6-digit code to <b>${esc(j.sent_to)}</b>.` : ''}${j.demo_code ? ` <br>Demo mode - your code is <span class="demo-code">${esc(j.demo_code)}</span>` : ''}`;
+const codeField = (label) => `<div class="field"><label>${label}</label><input name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" required class="code-input"></div>`;
+const back = '<p class="auth-links"><a href="#" data-auth="signin">Back to sign in</a></p>';
+const AUTH_VIEWS = {
+  register: () => `<h3>Create an account</h3><p class="small muted">For anyone who wants to submit an innovative idea to CEDA.</p><form data-auth-form="register">
+    <div class="field"><label>Full name</label><input name="full_name" required minlength="2" maxlength="200" autocomplete="name"></div>
+    <div class="field"><label>Username</label><input name="username" required minlength="3" maxlength="60" pattern="[A-Za-z0-9_.\-]+" autocomplete="username"></div>
+    <div class="field"><label>Email</label><input name="email" type="email" required autocomplete="email"></div>
+    <div class="field"><label>Mobile number (optional, for SMS alerts)</label><input name="phone" type="tel" placeholder="71 234 567" autocomplete="tel"></div>
+    <div class="field"><label>Password (at least 12 characters)</label><input name="password" type="password" required minlength="12" autocomplete="new-password"></div>
+    <label class="small"><input type="checkbox" name="accept_privacy" required> I agree that CEDA may use these details to process my idea and contact me about it.</label>
+    <button class="wide" type="submit">Create account</button></form>${back}`,
+  verify: () => `<h3>Confirm your email</h3><form data-auth-form="verify">${codeField('Code from the email')}<button class="wide" type="submit">Confirm and sign in</button></form>
+    <p class="auth-links"><a href="#" data-auth="resend">Send a new code</a><a href="#" data-auth="signin">Back to sign in</a></p>`,
+  forgot: () => `<h3>Reset your password</h3><p class="small muted">Enter your username or email. If we find the account we will send a reset code.</p><form data-auth-form="forgot">
+    <div class="field"><label>Username or email</label><input name="identifier" required autocomplete="username" value="${esc(auth.who)}"></div><button class="wide" type="submit">Send reset code</button></form>${back}`,
+  reset: () => `<h3>Choose a new password</h3><form data-auth-form="reset">${codeField('Reset code')}
+    <div class="field"><label>New password (at least 12 characters)</label><input name="new_password" type="password" required minlength="12" autocomplete="new-password"></div><button class="wide" type="submit">Save new password</button></form>${back}`,
+  help: () => '<div class="empty">Loading...</div>',
+  otp: () => `<h3>Enter your sign-in code</h3><form data-auth-form="otp">${codeField('Code from the email')}<button class="wide" type="submit">Sign in</button></form>${back}`,
+};
+function authView(name, msg, ok = true) {
+  const alt = $('authAlt');
+  document.querySelector('.login-card').classList.remove('wide-card');
+  if (name === 'signin') { alt.classList.add('hidden'); alt.innerHTML = ''; $('loginForm').classList.remove('hidden'); }
+  else { $('loginForm').classList.add('hidden'); alt.innerHTML = AUTH_VIEWS[name](); alt.classList.remove('hidden'); const i = alt.querySelector('input'); if (i) i.focus(); }
+  authMsg(ok, msg || '');
+}
+function signedIn(d) { token = d.access_token; sessionStorage.setItem('fl_token', token); $('password').value = ''; authView('signin'); boot(); }
+async function authPost(path, body) {
+  const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw Object.assign(new Error(errText(d, r.status)), { data: d });
+  return d;
+}
+const AUTH_FORMS = {
+  register: async (d) => { const j = await authPost('/api/auth/register', { ...d, accept_privacy: !!d.accept_privacy }); auth.who = j.username; authView('verify', sentLine(j, 'Account created.')); },
+  verify: async (d) => signedIn(await authPost('/api/auth/verify', { identifier: auth.who, code: d.code })),
+  forgot: async (d) => { auth.who = d.identifier.trim(); const j = await authPost('/api/auth/forgot', { identifier: auth.who }); authView('reset', sentLine(j, 'If that account exists, a reset code is on its way.')); },
+  reset: async (d) => { await authPost('/api/auth/reset', { identifier: auth.who, code: d.code, new_password: d.new_password }); $('username').value = auth.who; authView('signin', 'Password changed. Please sign in with your new password.'); },
+  otp: async (d) => signedIn(await authPost('/api/auth/login-code', { identifier: auth.who, code: d.code })),
+};
+document.addEventListener('click', async (e) => {
+  const a = e.target.closest('[data-auth]'); if (!a) return; e.preventDefault();
+  if (a.dataset.auth === 'resend') {
+    try { const j = await authPost('/api/auth/resend', { identifier: auth.who }); authMsg(true, sentLine(j, 'If the account still needs confirming, a new code is on its way.')); } catch (ex) { authMsg(false, esc(ex.message)); }
+    return;
+  }
+  if (a.dataset.auth === 'forgot') auth.who = $('username').value.trim();
+  authView(a.dataset.auth);
+  if (a.dataset.auth === 'help') {
+    await loadSite();
+    $('authAlt').innerHTML = (site ? helpHTML(site, false) : '<div class="empty">Help is not available right now.</div>') + back;
+    document.querySelector('.login-card').classList.add('wide-card');
+  }
+});
+document.addEventListener('submit', async (e) => {
+  const f = e.target.closest('[data-auth-form]'); if (!f) return; e.preventDefault();
+  const btn = f.querySelector('button[type=submit]'); busy(btn, true);
+  try { await AUTH_FORMS[f.dataset.authForm](formData(f)); } catch (ex) { authMsg(false, esc(ex.message)); } finally { busy(btn, false); }
+});
 $('loginForm').addEventListener('submit', async (e) => {
-  e.preventDefault(); const err = $('loginError'); err.classList.add('hidden');
+  e.preventDefault(); authMsg(true, '');
   const body = new URLSearchParams(); body.set('username', $('username').value.trim()); body.set('password', $('password').value);
   try {
     const r = await fetch('/api/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
     const d = await r.json().catch(() => ({}));
+    if (r.status === 403 && d.verification_required) { auth.who = d.username; authView('verify', sentLine(d, 'Please confirm your email address before signing in.')); return; }
     if (!r.ok) throw new Error(errText(d, r.status));
-    token = d.access_token; sessionStorage.setItem('fl_token', token); $('password').value = ''; boot();
-  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+    if (d.otp_required) { auth.who = d.username; authView('otp', sentLine(d, 'One more step.')); return; }
+    signedIn(d);
+  } catch (ex) { authMsg(false, esc(ex.message)); }
 });
+fetch('/api/auth/options').then((r) => r.json()).then((o) => { if (!o.self_registration) $('regLink').classList.add('hidden'); }).catch(() => {});
 boot();

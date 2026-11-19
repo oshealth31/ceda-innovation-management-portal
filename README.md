@@ -1,4 +1,4 @@
-# CEDA Innovation Management Portal (FundingLens AI v1.3.1)
+# CEDA Innovation Management Portal (FundingLens AI v1.5.0)
 
 Prototype for the CEDA Innovation Management Portal Hackathon (9-12 November 2026), built on the FundingLens AI platform.
 
@@ -24,6 +24,8 @@ Decision-support platform that helps funding institutions receive business plans
 3. Optional AI commentary (opt-in per institution) adds a summary and notes - quotations are verified against the document.
 4. Officer confirms figures, answers due diligence, refers to committee. A *different* committee member approves or declines. Everything is audited in a tamper-evident log.
 5. Committee report as HTML or Word.
+6. Anyone can create a submitter account, confirmed by an emailed code. Forgotten passwords are reset by code, users can turn on a one-time code at sign-in, and they choose free email or SMS alerts in Settings. Administrators see every message sent in the Message log. Email works through Brevo or any SMTP server, and SMS through any HTTP gateway (settings in `.env.example`).
+7. Administrators manage the help page (FAQs and regulator contacts), support categories and reply times, the dashboard announcement and extra questions on the idea form, all inside the portal. Submitters send support questions and see replies.
 
 Roles: `admin`, `officer`, `committee`, `applicant`.
 

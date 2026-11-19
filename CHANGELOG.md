@@ -2,6 +2,24 @@
 
 Version number lives in one place: the `VERSION` file. `backend/app.py` reads it; `/api/health`, reports and the Docker image all follow.
 
+## 1.5.0 - 2026-11-13
+Help, support and content management. Existing databases are upgraded on start-up (new tables, and one new column on ideas).
+- **Help and FAQs**: questions and answers grouped by topic, plus a directory of regulators and partners (CEDA, CIPA, BOBS, BOCRA, CCA, BURS, NBFIRA). Open to everyone from the sign-in page, without an account. Contact details were checked against the organisations' published notices on 13 November 2026.
+- **Support requests with reply times**: each kind of question has its own reply time in working days. Submitters send questions and see replies; administrators and evaluators see every request, which ones are overdue, and the share answered on time. Replies arrive as a notification and an email/SMS alert.
+- **Site content** for administrators: the dashboard announcement, welcome text, help introduction, support hours and contacts, support categories and reply times, FAQs and the contacts directory can all be changed in the portal. Every change is in the audit trail.
+- **Application form builder**: administrators add their own questions to the idea form (short or long answer, number, choose one, yes/no, date, web link), mark them required, reorder or hide them. Answers are checked by the server and shown with the idea.
+
+## 1.4.0 - 2026-11-13
+Accounts and alerts, to meet the updated judging criteria. Existing databases are upgraded on start-up (new user columns are added automatically).
+- **Create an account**: anyone can register as a submitter with name, username, email and optional mobile number. The account works once the 6-digit code emailed to them is confirmed. Can be switched off with `ALLOW_SELF_REGISTRATION=false`.
+- **Forgotten password**: a reset code goes to the account's email (or mobile if there is no email). The answer is the same whether or not the account exists. Resetting signs out every other session.
+- **One-time code at sign-in**: users can choose to be asked for an emailed code each time they sign in.
+- **Sign in with username or email.**
+- **Free alerts by email and SMS**: users choose in Settings. Every status change that already created an in-portal notification now also sends an alert to those who subscribed.
+- **Message log** for administrators: every email and SMS, its status and any error. Codes are never stored; they are masked in the log.
+- Codes are 6 digits, stored only as a keyed hash, single use, expire (10 minutes for sign-in, 30 otherwise) and stop working after 5 wrong tries. Requests are rate limited.
+- Email through Brevo's API or any SMTP server; SMS through any HTTP gateway. With neither configured, messages are recorded in the log, and `DEMO_SHOW_CODES=true` shows codes on screen for demos.
+
 ## 1.3.1 - 2026-11-11
 - Phones: no empty band above pages; the menu closes by tapping outside it, with its x button, or with the phone's Back button.
 - Releases now reach phones straight away: the page, styles and script are served with `Cache-Control: no-cache`, and the page asks for `styles.css` and `app.js` by version, so a browser can never pair a new page with an old stylesheet.

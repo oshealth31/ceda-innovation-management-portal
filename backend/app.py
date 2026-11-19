@@ -14,6 +14,8 @@ import os
 import re
 import secrets
 import tempfile
+import threading
+import time
 import uuid
 import zipfile
 from contextlib import asynccontextmanager
@@ -32,6 +34,7 @@ from sqlalchemy import (Boolean, DateTime, Float, ForeignKey, Integer, Numeric, 
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from . import analysis as A
+from . import messaging as MSG
 
 try:
     from openai import OpenAI
@@ -53,6 +56,7 @@ DOCS.mkdir(parents=True, exist_ok=True)
 MAX_UPLOAD_BYTES = int(os.getenv('MAX_UPLOAD_BYTES', '15000000'))
 ACCESS_MINUTES = int(os.getenv('ACCESS_TOKEN_MINUTES', '60'))
 ALGORITHM = 'HS256'
+REGISTER_LIMIT = int(os.getenv('REGISTER_LIMIT', '5'))    # new accounts per IP per hour
 LOGIN_LIMIT = int(os.getenv('LOGIN_LIMIT', '8'))          # attempts per username+IP per 5 min
 LOGIN_IP_LIMIT = int(os.getenv('LOGIN_IP_LIMIT', '40'))  # attempts per IP per 5 min
 
@@ -93,6 +97,12 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 Money = Numeric(18, 2, asdecimal=False)
 ROLES = ('admin', 'officer', 'committee', 'applicant')
+SELF_REGISTRATION = os.getenv('ALLOW_SELF_REGISTRATION', 'true').lower() in ('1', 'true', 'yes')
+# Demo only: return verification codes in API responses when no email/SMS service is set up. Never on in production.
+DEMO_SHOW_CODES = os.getenv('DEMO_SHOW_CODES', 'false').lower() in ('1', 'true', 'yes')
+PORTAL_URL = os.getenv('PORTAL_URL', '').rstrip('/')
+CODE_MINUTES = {'verify': 30, 'reset': 30, 'login': 10, 'email': 30}
+CODE_MAX_ATTEMPTS = 5
 STAFF = ('admin', 'officer', 'committee')
 
 
@@ -136,6 +146,45 @@ class User(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     token_version: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    # contact details, verification and alert preferences (1.4)
+    full_name: Mapped[str] = mapped_column(String(200), default='')
+    email: Mapped[str | None] = mapped_column(String(200), nullable=True, index=True)
+    phone: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    email_verified: Mapped[bool] = mapped_column(Boolean, default=True)   # self-registered accounts start False
+    pending_email: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    otp_login: Mapped[bool] = mapped_column(Boolean, default=False)       # ask for an emailed code at every sign-in
+    alert_email: Mapped[bool] = mapped_column(Boolean, default=True)
+    alert_sms: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class OneTimeCode(Base):
+    """6-digit codes for email verification, password reset and sign-in. Only a keyed hash is stored."""
+    __tablename__ = 'one_time_codes'
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.id'), index=True)
+    purpose: Mapped[str] = mapped_column(String(20))      # verify | reset | login | email
+    code_hash: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class OutboundMessage(Base):
+    """Every email and SMS the portal sends (or would send), for delivery and for the administrator's log."""
+    __tablename__ = 'outbound_messages'
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    institution_id: Mapped[str] = mapped_column(ForeignKey('institutions.id'), index=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'), nullable=True, index=True)
+    channel: Mapped[str] = mapped_column(String(10))      # email | sms
+    kind: Mapped[str] = mapped_column(String(20))         # verify | reset | login | email | alert
+    to_addr: Mapped[str] = mapped_column(String(200))
+    subject: Mapped[str] = mapped_column(String(200), default='')
+    body: Mapped[str] = mapped_column(Text, default='')   # codes are masked here; the code itself is never stored
+    status: Mapped[str] = mapped_column(String(20), default='queued', index=True)  # queued | sent | logged | failed
+    detail: Mapped[str] = mapped_column(String(300), default='')
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class FundingProgram(Base):
@@ -190,6 +239,7 @@ class Application(Base):
     target_users: Mapped[str] = mapped_column(Text, default='')
     sector: Mapped[str] = mapped_column(String(80), default='')
     stage: Mapped[str] = mapped_column(String(80), default='')
+    extra_json: Mapped[str] = mapped_column(Text, default='{}')  # answers to the administrator's extra form questions
     status: Mapped[str] = mapped_column(String(40), default='draft', index=True)
     created_by: Mapped[int] = mapped_column(ForeignKey('users.id'), index=True)
     referred_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -363,6 +413,80 @@ class KnowledgeItem(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class FormField(Base):
+    """An extra question on the idea form, set up by an administrator (no code change needed)."""
+    __tablename__ = 'form_fields'
+    __table_args__ = (UniqueConstraint('institution_id', 'key'),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    institution_id: Mapped[str] = mapped_column(ForeignKey('institutions.id'), index=True)
+    key: Mapped[str] = mapped_column(String(60))
+    label: Mapped[str] = mapped_column(String(200))
+    help: Mapped[str] = mapped_column(Text, default='')
+    kind: Mapped[str] = mapped_column(String(20), default='text')  # text|textarea|number|select|yes_no|date|url
+    options_json: Mapped[str] = mapped_column(Text, default='[]')
+    required: Mapped[bool] = mapped_column(Boolean, default=False)
+    sort: Mapped[int] = mapped_column(Integer, default=100)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class SiteContent(Base):
+    """Editable wording: announcement, welcome text, support details, support categories and response times."""
+    __tablename__ = 'site_content'
+    __table_args__ = (UniqueConstraint('institution_id', 'key'),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    institution_id: Mapped[str] = mapped_column(ForeignKey('institutions.id'), index=True)
+    key: Mapped[str] = mapped_column(String(60))
+    value: Mapped[str] = mapped_column(Text, default='')
+    updated_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class FaqItem(Base):
+    __tablename__ = 'faq_items'
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    institution_id: Mapped[str] = mapped_column(ForeignKey('institutions.id'), index=True)
+    category: Mapped[str] = mapped_column(String(80), default='General')
+    question: Mapped[str] = mapped_column(String(300))
+    answer: Mapped[str] = mapped_column(Text)
+    sort: Mapped[int] = mapped_column(Integer, default=100)
+    published: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class Contact(Base):
+    """Directory of regulators and partner organisations shown on the help page."""
+    __tablename__ = 'contacts'
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    institution_id: Mapped[str] = mapped_column(ForeignKey('institutions.id'), index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    purpose: Mapped[str] = mapped_column(Text, default='')
+    phone: Mapped[str] = mapped_column(String(120), default='')
+    email: Mapped[str] = mapped_column(String(200), default='')
+    website: Mapped[str] = mapped_column(String(200), default='')
+    address: Mapped[str] = mapped_column(String(300), default='')
+    sort: Mapped[int] = mapped_column(Integer, default=100)
+    published: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class SupportTicket(Base):
+    __tablename__ = 'support_tickets'
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    institution_id: Mapped[str] = mapped_column(ForeignKey('institutions.id'), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.id'), index=True)
+    application_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    category: Mapped[str] = mapped_column(String(60))
+    subject: Mapped[str] = mapped_column(String(200))
+    message: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default='open', index=True)  # open|answered|closed
+    due_at: Mapped[datetime] = mapped_column(DateTime)
+    response: Mapped[str] = mapped_column(Text, default='')
+    responded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    responded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 def init_db():
     insp = sa_inspect(engine)
     if insp.has_table('applications'):
@@ -376,6 +500,31 @@ def init_db():
                 'This database was created before the innovation-idea fields were added (1.3). '
                 'Start with a fresh database - see CHANGELOG.md.')
     Base.metadata.create_all(engine)
+    add_missing_columns('users', USER_COLUMNS_14)
+    add_missing_columns('applications', APPLICATION_COLUMNS_15)
+
+
+APPLICATION_COLUMNS_15 = {'extra_json': ("TEXT DEFAULT '{}'", None)}
+USER_COLUMNS_14 = {  # added in 1.4; existing databases get them in place, with safe defaults
+    'full_name': ("VARCHAR(200) DEFAULT ''", None), 'email': ('VARCHAR(200)', None), 'phone': ('VARCHAR(40)', None),
+    'email_verified': ('BOOLEAN', True), 'pending_email': ('VARCHAR(200)', None), 'otp_login': ('BOOLEAN', False),
+    'alert_email': ('BOOLEAN', True), 'alert_sms': ('BOOLEAN', False),
+}
+
+
+def add_missing_columns(table: str, columns: dict):
+    have = {c['name'] for c in sa_inspect(engine).get_columns(table)}
+    missing = [k for k in columns if k not in have]
+    if not missing:
+        return
+    with engine.begin() as conn:
+        for name in missing:
+            ddl, default = columns[name]
+            if default is not None:
+                lit = ('TRUE' if default else 'FALSE') if engine.dialect.name == 'postgresql' else ('1' if default else '0')
+                ddl = f'{ddl} DEFAULT {lit}'
+            conn.execute(sqltext(f'ALTER TABLE {table} ADD COLUMN {name} {ddl}'))
+    log.info('Added %s columns: %s', table, ', '.join(missing))
 
 
 # ----------------------------------------------------------------------------
@@ -418,6 +567,112 @@ def check_password_policy(password: str, username: str = ''):
         raise HTTPException(400, 'Password must contain at least 12 characters.')
     if username and username.lower() in password.lower():
         raise HTTPException(400, 'Password must not contain the username.')
+
+
+# ---- one-time codes and outgoing messages ---------------------------------------------------
+def _code_hash(user_id: int, purpose: str, code: str) -> str:
+    return hmac.new(SECRET_KEY.encode(), f'{purpose}:{user_id}:{code}'.encode(), hashlib.sha256).hexdigest()
+
+
+def issue_code(s: Session, u: User, purpose: str) -> str:
+    """A fresh 6-digit code; any earlier unused code for the same purpose stops working."""
+    now = utcnow()
+    for old in s.scalars(select(OneTimeCode).where(OneTimeCode.user_id == u.id, OneTimeCode.purpose == purpose,
+                                                   OneTimeCode.used_at.is_(None))).all():
+        old.used_at = now
+    code = f'{secrets.randbelow(10 ** 6):06d}'
+    s.add(OneTimeCode(id=new_id(), user_id=u.id, purpose=purpose, code_hash=_code_hash(u.id, purpose, code),
+                      expires_at=now + timedelta(minutes=CODE_MINUTES[purpose])))
+    return code
+
+
+def check_code(s: Session, u: User, purpose: str, code: str) -> bool:
+    """True once for the right, unexpired code. Five wrong tries and the code stops working."""
+    row = s.scalar(select(OneTimeCode).where(OneTimeCode.user_id == u.id, OneTimeCode.purpose == purpose,
+                                             OneTimeCode.used_at.is_(None)).order_by(OneTimeCode.created_at.desc()))
+    if not row or row.expires_at < utcnow() or row.attempts >= CODE_MAX_ATTEMPTS:
+        return False
+    if not hmac.compare_digest(row.code_hash, _code_hash(u.id, purpose, (code or '').strip())):
+        row.attempts += 1
+        return False
+    row.used_at = utcnow()
+    return True
+
+
+def deliver(s: Session, m: OutboundMessage, real_body: str | None = None):
+    """Send one message now. real_body carries text with a code in it, which is never written to the database."""
+    text_out = real_body or m.body
+    status, detail = (MSG.send_email(m.to_addr, m.subject, text_out) if m.channel == 'email'
+                      else MSG.send_sms(m.to_addr, text_out))
+    m.status, m.detail, m.sent_at = status, detail[:300], utcnow()
+    if status == 'failed':
+        log.warning('Message %s to %s failed: %s', m.id, m.channel, detail)
+
+
+CODE_TEXT = {
+    'verify': ('Confirm your email address', 'Welcome to the CEDA Innovation Management Portal. Your verification code is {code}. It expires in 30 minutes.'),
+    'reset': ('Reset your password', 'Your password reset code is {code}. It expires in 30 minutes. If you did not ask for this, ignore this message.'),
+    'login': ('Your sign-in code', 'Your sign-in code is {code}. It expires in 10 minutes.'),
+    'email': ('Confirm your new email address', 'Your code to confirm this email address is {code}. It expires in 30 minutes.'),
+}
+
+
+def send_code(s: Session, u: User, purpose: str, channel: str, to_addr: str) -> dict:
+    """Issue a code and send it straight away. Returns what the screen may show about where it went."""
+    code = issue_code(s, u, purpose)
+    subject, template = CODE_TEXT[purpose]
+    m = OutboundMessage(id=new_id(), institution_id=u.institution_id, user_id=u.id, channel=channel, kind=purpose,
+                        to_addr=to_addr, subject=subject, body=template.format(code='\u2022' * 6))
+    s.add(m)
+    deliver(s, m, real_body=template.format(code=code))
+    out = {'sent_to': MSG.mask_email(to_addr) if channel == 'email' else to_addr[:-4] + '****', 'delivery': m.status}
+    if DEMO_SHOW_CODES and m.status != 'sent':
+        out['demo_code'] = code
+    return out
+
+
+def queue_alert(s: Session, u: User, subject: str, text_body: str):
+    """Alerts the user subscribed to, by email and/or SMS. The background sender delivers them."""
+    link = f'\n\nOpen the portal: {PORTAL_URL}' if PORTAL_URL else ''
+    if u.alert_email and u.email and u.email_verified:
+        s.add(OutboundMessage(id=new_id(), institution_id=u.institution_id, user_id=u.id, channel='email', kind='alert',
+                              to_addr=u.email, subject=subject, body=text_body + link))
+    if u.alert_sms and u.phone:
+        s.add(OutboundMessage(id=new_id(), institution_id=u.institution_id, user_id=u.id, channel='sms', kind='alert',
+                              to_addr=u.phone, subject=subject, body=text_body[:300]))
+
+
+def dispatch_outbox(limit: int = 50) -> int:
+    """Deliver queued alerts, oldest first. Called by the background sender, and directly in tests."""
+    s = SessionLocal()
+    try:
+        rows = s.scalars(select(OutboundMessage).where(OutboundMessage.status == 'queued')
+                         .order_by(OutboundMessage.created_at).limit(limit)).all()
+        for m in rows:
+            deliver(s, m)
+            s.commit()
+        return len(rows)
+    finally:
+        s.close()
+
+
+_DISPATCHER_STARTED = False
+
+
+def start_dispatcher():
+    global _DISPATCHER_STARTED
+    if _DISPATCHER_STARTED or ENVIRONMENT == 'test' or os.getenv('ALERT_DISPATCH', 'on') == 'off':
+        return
+    _DISPATCHER_STARTED = True
+
+    def loop():
+        while True:
+            try:
+                dispatch_outbox()
+            except Exception:  # never let one bad message stop alerts for everyone
+                log.exception('Alert dispatch failed')
+            time.sleep(5)
+    threading.Thread(target=loop, name='alert-dispatcher', daemon=True).start()
 
 
 def db():
@@ -505,6 +760,7 @@ class ApplicationCreate(BaseModel):
     target_users: str = Field(default='', max_length=3000)
     sector: str = Field(default='', max_length=80)
     stage: str = Field(default='', max_length=80)
+    answers: dict = Field(default_factory=dict)
 
 
 IDEA_REQUIRED = (('idea_title', 'Idea title'), ('problem', 'Problem'), ('solution', 'Proposed solution'),
@@ -522,6 +778,10 @@ class IdeaUpdate(BaseModel):
     target_users: str = Field(min_length=1, max_length=3000)
     sector: str = Field(min_length=1, max_length=80)
     stage: str = Field(min_length=1, max_length=80)
+    answers: dict | None = None
+
+
+IDEA_TEXT_FIELDS = ('idea_title', 'problem', 'solution', 'target_users', 'sector', 'stage')
 
 
 class AssignmentRequest(BaseModel):
@@ -587,6 +847,46 @@ class UserCreate(BaseModel):
     username: str = Field(min_length=3, max_length=60, pattern=r'^[A-Za-z0-9_.-]+$')
     password: str
     role: str
+    full_name: str = Field(default='', max_length=200)
+    email: str = Field(default='', max_length=200)
+    phone: str = Field(default='', max_length=40)
+
+
+class RegisterRequest(BaseModel):
+    full_name: str = Field(min_length=2, max_length=200)
+    username: str = Field(min_length=3, max_length=60, pattern=r'^[A-Za-z0-9_.-]+$')
+    email: str = Field(min_length=5, max_length=200)
+    phone: str = Field(default='', max_length=40)
+    password: str = Field(max_length=200)
+    accept_privacy: bool
+
+
+class CodeRequest(BaseModel):
+    identifier: str = Field(min_length=1, max_length=200)   # username or email
+    code: str = Field(min_length=4, max_length=10)
+
+
+class IdentifierRequest(BaseModel):
+    identifier: str = Field(min_length=1, max_length=200)
+
+
+class ResetRequest(BaseModel):
+    identifier: str = Field(min_length=1, max_length=200)
+    code: str = Field(min_length=4, max_length=10)
+    new_password: str = Field(max_length=200)
+
+
+class PreferencesUpdate(BaseModel):
+    full_name: str | None = Field(default=None, max_length=200)
+    email: str | None = Field(default=None, max_length=200)
+    phone: str | None = Field(default=None, max_length=40)
+    alert_email: bool | None = None
+    alert_sms: bool | None = None
+    otp_login: bool | None = None
+
+
+class EmailCode(BaseModel):
+    code: str = Field(min_length=4, max_length=10)
 
 
 class UserUpdate(BaseModel):
@@ -692,6 +992,9 @@ def jl(text, default=None):
 def notify(s: Session, inst_id: str, user_ids, app: Application, kind: str, message: str):
     for uid in set(user_ids):
         s.add(Notification(institution_id=inst_id, user_id=uid, application_id=app.id, kind=kind, message=message))
+        u = s.get(User, uid)
+        if u and u.active:
+            queue_alert(s, u, 'Update on ' + (app.idea_title or app.applicant_name or 'your idea')[:150], message)
 
 
 def staff_ids(s: Session, inst_id: str, roles=STAFF, exclude=None):
@@ -937,6 +1240,7 @@ def seed():
                                         'Financial figures are calculated by deterministic code and extracted figures must be '
                                         'confirmed by an officer. Final approval or decline requires an authorised human '
                                         'decision-maker who did not refer the application.'))
+        seed_content(s, inst)
         s.commit()
         if os.getenv('SEED_DEMO', '').lower() in ('1', 'true', 'yes'):
             seed_demo(s, inst, prog)
@@ -980,6 +1284,7 @@ def seed_demo(s: Session, inst: Institution, prog: FundingProgram):
 async def lifespan(_: FastAPI):
     init_db()
     seed()
+    start_dispatcher()
     yield
 
 
@@ -1044,22 +1349,244 @@ def login(request: Request, form: OAuth2PasswordRequestForm = Depends(), s: Sess
     ip = client_ip(request)
     if not rate_ok(f'login:{ip}:{form.username.lower()}', LOGIN_LIMIT, 300) or not rate_ok(f'loginip:{ip}', LOGIN_IP_LIMIT, 300):
         raise HTTPException(429, 'Too many login attempts; try again later.')
-    u = s.scalar(select(User).where(User.username == form.username))
+    u = find_user(s, form.username)
     if not u or not u.active or not verify_password(form.password, u.password_hash):
         if u:
             audit(s, u.institution_id, u.id, 'login_failed', 'user', u.id, f'ip={ip}')
             s.commit()
         raise HTTPException(401, 'Incorrect username or password')
+    if not u.email_verified:
+        sent = {}
+        if u.email and rate_ok(f'resend:{u.id}', 3, 600):
+            sent = send_code(s, u, 'verify', 'email', u.email)
+            s.commit()
+        return JSONResponse(status_code=403, content={'detail': 'Please confirm your email address first.',
+                                                      'verification_required': True, 'username': u.username, **sent})
+    if u.otp_login and u.email:
+        sent = send_code(s, u, 'login', 'email', u.email)
+        audit(s, u.institution_id, u.id, 'login_code_sent', 'user', u.id, f'ip={ip}')
+        s.commit()
+        return {'otp_required': True, 'username': u.username, **sent}
     audit(s, u.institution_id, u.id, 'login', 'user', u.id, f'ip={ip}')
     s.commit()
     return {'access_token': token_for(u), 'token_type': 'bearer', 'role': u.role, 'username': u.username}
 
 
+def find_user(s: Session, identifier: str) -> User | None:
+    """By username, or by email address when it looks like one."""
+    ident = (identifier or '').strip()
+    u = s.scalar(select(User).where(User.username == ident))
+    if not u and '@' in ident:
+        u = s.scalar(select(User).where(func.lower(User.email) == ident.lower()))
+    return u
+
+
+def default_institution(s: Session) -> Institution:
+    inst = s.scalar(select(Institution).where(Institution.code == os.getenv('INSTITUTION_CODE', 'PILOT')))
+    return inst or s.scalar(select(Institution).order_by(Institution.created_at))
+
+
+def email_taken(s: Session, email: str, except_id: int | None = None) -> bool:
+    q = select(User.id).where(or_(func.lower(User.email) == email.lower(), func.lower(User.pending_email) == email.lower()))
+    return any(i != except_id for i in s.scalars(q).all())
+
+
+def clean_contact(email: str, phone: str) -> tuple[str, str]:
+    email, phone = (email or '').strip().lower(), MSG.normalise_phone(phone or '')
+    if email and not MSG.valid_email(email):
+        raise HTTPException(422, 'Please enter a valid email address.')
+    if phone and not MSG.valid_phone(phone):
+        raise HTTPException(422, 'Please enter a valid phone number, e.g. 71 234 567.')
+    return email, phone
+
+
+@app.post('/api/auth/register')
+def register(req: RegisterRequest, request: Request, s: Session = Depends(db)):
+    """Anyone can create a submitter account. It works once the emailed code is confirmed."""
+    if not SELF_REGISTRATION:
+        raise HTTPException(403, 'Self-registration is switched off. Ask the portal administrator for an account.')
+    if not rate_ok(f'register:{client_ip(request)}', REGISTER_LIMIT, 3600):
+        raise HTTPException(429, 'Too many sign-ups from this connection. Try again later.')
+    if not req.accept_privacy:
+        raise HTTPException(422, 'Please accept the privacy notice to continue.')
+    email, phone = clean_contact(req.email, req.phone)
+    if not email:
+        raise HTTPException(422, 'Please enter a valid email address.')
+    check_password_policy(req.password, req.username)
+    if s.scalar(select(User).where(func.lower(User.username) == req.username.lower())):
+        raise HTTPException(409, 'That username is already taken.')
+    if email_taken(s, email):
+        raise HTTPException(409, 'An account with that email address already exists. Try signing in, or reset your password.')
+    inst = default_institution(s)
+    u = User(username=req.username, password_hash=hash_password(req.password), role='applicant', institution_id=inst.id,
+             full_name=req.full_name.strip(), email=email, phone=phone or None, email_verified=False)
+    s.add(u)
+    s.flush()
+    audit(s, inst.id, u.id, 'register', 'user', u.id, json.dumps({'username': u.username}))
+    sent = send_code(s, u, 'verify', 'email', email)
+    s.commit()
+    return {'status': 'verification_sent', 'username': u.username, **sent}
+
+
+@app.post('/api/auth/verify')
+def verify_email(req: CodeRequest, request: Request, s: Session = Depends(db)):
+    if not rate_ok(f'code:{client_ip(request)}', 20, 900):
+        raise HTTPException(429, 'Too many attempts. Try again later.')
+    u = find_user(s, req.identifier)
+    if not u or not u.active or u.email_verified or not check_code(s, u, 'verify', req.code):
+        s.commit()  # keep the failed-attempt count
+        raise HTTPException(400, 'That code is not right, or it has expired. Ask for a new one.')
+    u.email_verified = True
+    audit(s, u.institution_id, u.id, 'verify_email', 'user', u.id)
+    s.commit()
+    return {'access_token': token_for(u), 'token_type': 'bearer', 'role': u.role, 'username': u.username}
+
+
+@app.post('/api/auth/resend')
+def resend_code(req: IdentifierRequest, request: Request, s: Session = Depends(db)):
+    u = find_user(s, req.identifier)
+    if u and u.active and not u.email_verified and u.email and rate_ok(f'resend:{u.id}', 3, 600) \
+            and rate_ok(f'resendip:{client_ip(request)}', 10, 900):
+        sent = send_code(s, u, 'verify', 'email', u.email)
+        s.commit()
+        return {'status': 'sent', **sent}
+    return {'status': 'sent'}
+
+
+@app.post('/api/auth/forgot')
+def forgot_password(req: IdentifierRequest, request: Request, s: Session = Depends(db)):
+    """Same answer whether or not the account exists, so the form cannot be used to find out who has one."""
+    ip = client_ip(request)
+    if not rate_ok(f'forgotip:{ip}', 10, 900):
+        raise HTTPException(429, 'Too many requests. Try again later.')
+    u = find_user(s, req.identifier)
+    out = {'status': 'sent_if_exists'}
+    if u and u.active and rate_ok(f'forgot:{u.id}', 3, 900):
+        if u.email:
+            out.update(send_code(s, u, 'reset', 'email', u.email))
+        elif u.phone:
+            out.update(send_code(s, u, 'reset', 'sms', u.phone))
+        audit(s, u.institution_id, u.id, 'password_reset_requested', 'user', u.id, f'ip={ip}')
+        s.commit()
+    out.pop('delivery', None)
+    return out
+
+
+@app.post('/api/auth/reset')
+def reset_password(req: ResetRequest, request: Request, s: Session = Depends(db)):
+    if not rate_ok(f'code:{client_ip(request)}', 20, 900):
+        raise HTTPException(429, 'Too many attempts. Try again later.')
+    u = find_user(s, req.identifier)
+    if not u or not u.active:
+        raise HTTPException(400, 'That code is not right, or it has expired. Ask for a new one.')
+    check_password_policy(req.new_password, u.username)
+    if not check_code(s, u, 'reset', req.code):
+        s.commit()
+        raise HTTPException(400, 'That code is not right, or it has expired. Ask for a new one.')
+    u.password_hash = hash_password(req.new_password)
+    u.token_version += 1  # signs out every other session
+    if u.email:
+        u.email_verified = True  # they proved they can read that inbox
+    audit(s, u.institution_id, u.id, 'password_reset', 'user', u.id)
+    s.commit()
+    return {'status': 'reset'}
+
+
+@app.post('/api/auth/login-code')
+def login_with_code(req: CodeRequest, request: Request, s: Session = Depends(db)):
+    if not rate_ok(f'code:{client_ip(request)}', 20, 900):
+        raise HTTPException(429, 'Too many attempts. Try again later.')
+    u = find_user(s, req.identifier)
+    if not u or not u.active or not check_code(s, u, 'login', req.code):
+        s.commit()
+        raise HTTPException(400, 'That code is not right, or it has expired. Sign in again for a new one.')
+    audit(s, u.institution_id, u.id, 'login', 'user', u.id, f'ip={client_ip(request)} code')
+    s.commit()
+    return {'access_token': token_for(u), 'token_type': 'bearer', 'role': u.role, 'username': u.username}
+
+
+@app.get('/api/auth/options')
+def auth_options():
+    """What the sign-in page may offer."""
+    return {'self_registration': SELF_REGISTRATION, 'email': MSG.email_channel() != 'log', 'sms': MSG.sms_channel() != 'log'}
+
+
 @app.get('/api/me')
 def me(u: User = Depends(current_user), s: Session = Depends(db)):
     inst = s.get(Institution, u.institution_id)
-    return {'id': u.id, 'username': u.username, 'role': u.role,
+    return {'id': u.id, 'username': u.username, 'role': u.role, 'full_name': u.full_name,
             'institution': {'id': inst.id, 'name': inst.name, 'code': inst.code, 'ai_enabled': inst.ai_enabled}}
+
+
+def prefs_dict(u: User) -> dict:
+    return {'full_name': u.full_name, 'email': u.email, 'phone': u.phone, 'email_verified': u.email_verified,
+            'pending_email': u.pending_email, 'alert_email': u.alert_email, 'alert_sms': u.alert_sms,
+            'otp_login': u.otp_login, 'channels': {'email': MSG.email_channel() != 'log', 'sms': MSG.sms_channel() != 'log'}}
+
+
+@app.get('/api/me/preferences')
+def get_preferences(u: User = Depends(current_user)):
+    return prefs_dict(u)
+
+
+@app.put('/api/me/preferences')
+def set_preferences(req: PreferencesUpdate, u: User = Depends(current_user), s: Session = Depends(db)):
+    """Contact details and alerts. A new email address only takes over once its code is confirmed."""
+    out = {}
+    if req.full_name is not None:
+        u.full_name = req.full_name.strip()
+    if req.phone is not None:
+        _, phone = clean_contact('', req.phone)
+        u.phone = phone or None
+    if req.email is not None:
+        email, _ = clean_contact(req.email, '')
+        if email and email != (u.email or ''):
+            if email_taken(s, email, except_id=u.id):
+                raise HTTPException(409, 'Another account already uses that email address.')
+            if not rate_ok(f'emailchange:{u.id}', 3, 900):
+                raise HTTPException(429, 'Too many changes. Try again later.')
+            u.pending_email = email
+            out = send_code(s, u, 'email', 'email', email)
+    if req.alert_email is not None:
+        u.alert_email = req.alert_email
+    if req.alert_sms is not None:
+        if req.alert_sms and not u.phone:
+            raise HTTPException(422, 'Add a phone number first to get SMS alerts.')
+        u.alert_sms = req.alert_sms
+    if req.otp_login is not None:
+        if req.otp_login and not (u.email and u.email_verified):
+            raise HTTPException(422, 'Confirm an email address first: the sign-in code is sent there.')
+        u.otp_login = req.otp_login
+    audit(s, u.institution_id, u.id, 'update_preferences', 'user', u.id,
+          json.dumps({k: v for k, v in req.model_dump().items() if v is not None and k not in ('email', 'phone')}))
+    s.commit()
+    return {**prefs_dict(u), **out}
+
+
+@app.post('/api/me/email/verify')
+def confirm_new_email(req: EmailCode, request: Request, u: User = Depends(current_user), s: Session = Depends(db)):
+    if not rate_ok(f'code:{client_ip(request)}', 20, 900):
+        raise HTTPException(429, 'Too many attempts. Try again later.')
+    if not u.pending_email or not check_code(s, u, 'email', req.code):
+        s.commit()
+        raise HTTPException(400, 'That code is not right, or it has expired.')
+    u.email, u.pending_email, u.email_verified = u.pending_email, None, True
+    audit(s, u.institution_id, u.id, 'change_email', 'user', u.id)
+    s.commit()
+    return prefs_dict(u)
+
+
+@app.get('/api/admin/messages')
+def message_log(limit: int = Query(100, ge=1, le=500), u: User = Depends(require_roles('admin')), s: Session = Depends(db)):
+    """Emails and SMS the portal sent or recorded. Codes are always masked."""
+    rows = s.scalars(select(OutboundMessage).where(OutboundMessage.institution_id == u.institution_id)
+                     .order_by(OutboundMessage.created_at.desc()).limit(limit)).all()
+    counts = dict(s.execute(select(OutboundMessage.status, func.count()).where(OutboundMessage.institution_id == u.institution_id)
+                            .group_by(OutboundMessage.status)).all())
+    return {'counts': counts, 'channels': {'email': MSG.email_channel(), 'sms': MSG.sms_channel()},
+            'items': [{'id': m.id, 'channel': m.channel, 'kind': m.kind, 'to': m.to_addr, 'subject': m.subject, 'body': m.body,
+                       'status': m.status, 'detail': m.detail, 'created_at': iso(m.created_at), 'sent_at': iso(m.sent_at)}
+                      for m in rows]}
 
 
 @app.post('/api/me/password')
@@ -1075,7 +1602,8 @@ def change_password(req: PasswordChange, u: User = Depends(current_user), s: Ses
 
 
 def user_dict(x: User) -> dict:
-    return {'id': x.id, 'username': x.username, 'role': x.role, 'active': x.active, 'created_at': iso(x.created_at)}
+    return {'id': x.id, 'username': x.username, 'role': x.role, 'active': x.active, 'created_at': iso(x.created_at),
+            'full_name': x.full_name, 'email': x.email, 'phone': x.phone, 'email_verified': x.email_verified}
 
 
 @app.get('/api/users')
@@ -1091,7 +1619,11 @@ def create_user(req: UserCreate, u: User = Depends(require_roles('admin')), s: S
     check_password_policy(req.password, req.username)
     if s.scalar(select(User).where(func.lower(User.username) == req.username.lower())):
         raise HTTPException(409, 'That username is already taken.')
-    x = User(username=req.username, password_hash=hash_password(req.password), role=req.role, institution_id=u.institution_id)
+    email, phone = clean_contact(req.email, req.phone)
+    if email and email_taken(s, email):
+        raise HTTPException(409, 'Another account already uses that email address.')
+    x = User(username=req.username, password_hash=hash_password(req.password), role=req.role, institution_id=u.institution_id,
+             full_name=req.full_name.strip(), email=email or None, phone=phone or None)
     s.add(x)
     s.flush()
     audit(s, u.institution_id, u.id, 'create', 'user', x.id, json.dumps({'username': x.username, 'role': x.role}))
@@ -1247,7 +1779,7 @@ def app_summary(a: Application) -> dict:
 
 def idea_dict(a: Application) -> dict:
     return {'idea_title': a.idea_title, 'problem': a.problem, 'solution': a.solution, 'target_users': a.target_users,
-            'sector': a.sector, 'stage': a.stage}
+            'sector': a.sector, 'stage': a.stage, 'answers': jl(a.extra_json, {})}
 
 
 @app.post('/api/applications')
@@ -1260,7 +1792,8 @@ def create_application(req: ApplicationCreate, u: User = Depends(current_user), 
         missing = missing_idea_fields(req)
         if missing:
             raise HTTPException(422, 'Please complete the required fields: ' + ', '.join(missing) + '.')
-    a = Application(id=new_id(), institution_id=u.institution_id, programme_id=req.programme_id,
+    answers = clean_answers(s, u.institution_id, req.answers, enforce_required=u.role == 'applicant')
+    a = Application(extra_json=json.dumps(answers), id=new_id(), institution_id=u.institution_id, programme_id=req.programme_id,
                     applicant_name=req.applicant_name.strip(), funding_request=req.funding_request,
                     owner_contribution=req.owner_contribution, created_by=u.id,
                     idea_title=req.idea_title.strip(), problem=req.problem.strip(), solution=req.solution.strip(),
@@ -1559,8 +2092,10 @@ def update_idea(app_id: str, req: IdeaUpdate, u: User = Depends(current_user), s
         raise HTTPException(403, 'Only the submitter can edit this idea.')
     if a.status not in ('draft', 'request_information'):
         raise HTTPException(409, f'The idea cannot be edited while it is "{a.status}".')
-    for k in IdeaUpdate.model_fields:
+    for k in IDEA_TEXT_FIELDS:
         setattr(a, k, getattr(req, k).strip())
+    if req.answers is not None:
+        a.extra_json = json.dumps(clean_answers(s, a.institution_id, req.answers, enforce_required=True))
     audit(s, a.institution_id, u.id, 'edit_idea', 'application', a.id, 'Idea details updated')
     s.commit()
     return {**app_summary(a), **idea_dict(a)}
@@ -1921,6 +2456,502 @@ def notification_read(nid: int, u: User = Depends(current_user), s: Session = De
     n.read = True
     s.commit()
     return {'ok': True}
+
+
+# ----------------------------------------------------------------------------
+# Help, FAQs, contacts, support requests and administrator-managed content (1.5)
+# ----------------------------------------------------------------------------
+DEFAULT_SUPPORT_CATEGORIES = [
+    {'key': 'account', 'label': 'My account or signing in', 'days': 1},
+    {'key': 'technical', 'label': 'Something on the portal is not working', 'days': 1},
+    {'key': 'submission', 'label': 'Submitting or editing my idea', 'days': 2},
+    {'key': 'review', 'label': 'Where my idea is in the review', 'days': 3},
+    {'key': 'other', 'label': 'Anything else', 'days': 3},
+]
+CONTENT_DEFAULTS = {
+    'announcement': '',
+    'welcome': ('Welcome to the CEDA Innovation Management Portal. Tell us about your idea, upload any supporting '
+                'document, and follow every step of the review here. You will get an alert each time something changes.'),
+    'support_intro': ('Need help? Check the questions below first. If your question is not answered, send it to us from '
+                      'the Support page and we will reply within the time shown for that kind of question.'),
+    'support_hours': 'Monday to Friday, 08:00 to 17:00, except public holidays.',
+    'support_email': '',
+    'support_phone': '',
+    'support_categories': json.dumps(DEFAULT_SUPPORT_CATEGORIES),
+}
+PUBLIC_CONTENT = ('announcement', 'welcome', 'support_intro', 'support_hours', 'support_email', 'support_phone')
+FIELD_KINDS = ('text', 'textarea', 'number', 'select', 'yes_no', 'date', 'url')
+SUPPORT_ROLES = ('admin', 'officer')
+
+# Public contact details checked against the organisations' published notices on 13 November 2026.
+# Administrators can edit or hide any of them in Site content.
+DEFAULT_CONTACTS = [
+    ('Citizen Entrepreneurial Development Agency (CEDA)', 'Funding, mentoring and the innovation programme itself.',
+     '+267 317 0895', '', 'https://www.ceda.co.bw', 'Gaborone CBD'),
+    ('Companies and Intellectual Property Authority (CIPA)',
+     'Registering a company or business name, and protecting your idea with a patent, trade mark or industrial design.',
+     '+267 367 3700', 'info@cipa.co.bw', 'https://www.cipa.co.bw', 'Plot 54358, Prime Plaza, CBD, Gaborone'),
+    ('Botswana Bureau of Standards (BOBS)', 'National standards, product testing and certification marks.',
+     '+267 390 3200 / toll-free 0800 600 900', 'info@hq.bobstandards.bw', 'https://www.bobstandards.bw',
+     'Plot 55745, Block 8, Main Airport Road, Gaborone'),
+    ('Botswana Communications Regulatory Authority (BOCRA)',
+     'Telecommunications, internet and ICT services, radio, broadcasting, postal services, equipment type approval and .bw domains.',
+     '+267 395 7755', '', 'https://www.bocra.org.bw', 'Plot 50671, Independence Avenue, Gaborone'),
+    ('Competition and Consumer Authority (CCA)', 'Fair competition and consumer protection.',
+     '+267 393 4278', 'info@cca.co.bw', 'https://www.cca.co.bw', 'Plot 28, Matsitama Road, Main Mall, Gaborone'),
+    ('Botswana Unified Revenue Service (BURS)', 'Tax registration, VAT and tax clearance certificates.',
+     '+267 363 8000', '', 'https://www.burs.org.bw', 'Plot 53976, Kudumatse Drive, Gaborone'),
+    ('Non-Bank Financial Institutions Regulatory Authority (NBFIRA)',
+     'Fintech ideas that touch insurance, pensions, micro-lending or investments.',
+     '+267 310 2595', 'info@nbfira.org.bw', 'https://www.nbfira.org.bw',
+     '3rd Floor, Exponential Building, Plot 54351, New CBD, Gaborone'),
+]
+DEFAULT_FAQS = [
+    ('Getting started', 'Who can submit an idea?',
+     'Anyone with an innovative idea can create an account and submit it. Each call (programme) may set its own rules, '
+     'so read the call description before you start.'),
+    ('Getting started', 'How do I create an account?',
+     'Choose "Create an account" on the sign-in page, fill in your details and type in the 6-digit code we email you. '
+     'Your account works as soon as the code is confirmed.'),
+    ('Getting started', 'I forgot my password. What do I do?',
+     'Choose "Forgot password?" on the sign-in page. We send a reset code to your email address (or to your phone if '
+     'you have no email on the account). The code works once and expires after 30 minutes.'),
+    ('My idea', 'What do I need to submit?',
+     'The idea title, the problem it solves, your solution, who it is for, the sector and how far along it is. You can '
+     'also upload a supporting document such as a concept note or business plan (PDF, Word or text).'),
+    ('My idea', 'Can I change my idea after I submit it?',
+     'Not while it is with the review panel. If the panel sends it back for more information, you can edit it and '
+     'submit again. Every change is kept in the timeline.'),
+    ('My idea', 'How will I know what is happening with my idea?',
+     'Open the idea to see its timeline and any feedback. You also get an alert in the portal and, if you choose it in '
+     'Settings, by email or SMS each time the status changes.'),
+    ('My idea', 'How are ideas judged?',
+     'Evaluators assigned to your idea score it against published criteria, which you can ask about through Support. '
+     'Adjudicators make the final decision. The person who refers an idea cannot also approve it.'),
+    ('Protecting your idea', 'How can I protect my idea?',
+     'An idea on its own cannot be registered, but an invention can be patented and a brand or logo can be registered as a '
+     'trade mark. Both are handled by CIPA (see contacts below). Talk to CIPA before you share technical details widely.'),
+    ('Rules and regulators', 'Do I need a registered company?',
+     'Not to submit an idea. If your idea is funded or you start trading, you will need to register a company or '
+     'business name with CIPA and register for tax with BURS.'),
+    ('Rules and regulators', 'My product is an app, a device or uses mobile networks. Who regulates that?',
+     'BOCRA regulates telecommunications, internet and ICT services, and approves radio and telecoms equipment. If your '
+     'product handles payments, insurance or lending, also check with NBFIRA or the Bank of Botswana.'),
+    ('Rules and regulators', 'My product will be sold to the public. Are there standards it must meet?',
+     'Some products must meet compulsory Botswana standards. BOBS can tell you which standards apply and how to get '
+     'your product tested and certified.'),
+    ('Rules and regulators', 'Who looks after personal data?',
+     'The Data Protection Act, 2024 applies to anyone who collects personal data. The Information and Data Protection '
+     'Commission supervises it. If your idea collects personal data, plan how you will protect it from the start.'),
+    ('Support', 'How quickly will I get a reply?',
+     'Each kind of question has its own reply time, shown on the Support page. Times are in working days, Monday to Friday.'),
+]
+
+
+def add_working_days(start: datetime, days: int) -> datetime:
+    d = start
+    while days > 0:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            days -= 1
+    return d
+
+
+def seed_content(s: Session, inst: Institution):
+    have = set(s.scalars(select(SiteContent.key).where(SiteContent.institution_id == inst.id)).all())
+    for k, v in CONTENT_DEFAULTS.items():
+        if k not in have:
+            s.add(SiteContent(institution_id=inst.id, key=k, value=v))
+    if not s.scalar(select(FaqItem.id).where(FaqItem.institution_id == inst.id).limit(1)):
+        for i, (cat, q, a) in enumerate(DEFAULT_FAQS):
+            s.add(FaqItem(id=new_id(), institution_id=inst.id, category=cat, question=q, answer=a, sort=(i + 1) * 10))
+    if not s.scalar(select(Contact.id).where(Contact.institution_id == inst.id).limit(1)):
+        for i, (name, purpose, phone, email, web, addr) in enumerate(DEFAULT_CONTACTS):
+            s.add(Contact(id=new_id(), institution_id=inst.id, name=name, purpose=purpose, phone=phone, email=email,
+                          website=web, address=addr, sort=(i + 1) * 10))
+
+
+def content_map(s: Session, inst_id: str) -> dict:
+    rows = s.scalars(select(SiteContent).where(SiteContent.institution_id == inst_id)).all()
+    return {**CONTENT_DEFAULTS, **{r.key: r.value for r in rows}}
+
+
+def support_categories(s: Session, inst_id: str) -> list[dict]:
+    return jl(content_map(s, inst_id).get('support_categories'), DEFAULT_SUPPORT_CATEGORIES) or DEFAULT_SUPPORT_CATEGORIES
+
+
+def field_dict(f: FormField) -> dict:
+    return {'id': f.id, 'key': f.key, 'label': f.label, 'help': f.help, 'kind': f.kind, 'options': jl(f.options_json, []),
+            'required': f.required, 'sort': f.sort, 'enabled': f.enabled}
+
+
+def clean_answers(s: Session, inst_id: str, answers: dict | None, enforce_required: bool) -> dict:
+    """Keep only answers to enabled questions, check their type, and (for submitters) that required ones are filled."""
+    answers = answers or {}
+    fields = s.scalars(select(FormField).where(FormField.institution_id == inst_id, FormField.enabled == True)  # noqa: E712
+                       .order_by(FormField.sort, FormField.label)).all()
+    out, missing, bad = {}, [], []
+    for f in fields:
+        v = answers.get(f.key)
+        if isinstance(v, str):
+            v = v.strip()
+        if v in (None, '', []):
+            if f.required and enforce_required:
+                missing.append(f.label)
+            continue
+        if f.kind == 'number':
+            try:
+                v = float(v)
+                if v != v or abs(v) > 1e12:
+                    raise ValueError
+            except (TypeError, ValueError):
+                bad.append(f'{f.label} must be a number')
+                continue
+        elif f.kind == 'yes_no':
+            if isinstance(v, str):
+                v = v.lower() in ('yes', 'true', '1')
+            v = bool(v)
+        elif f.kind == 'select':
+            if str(v) not in jl(f.options_json, []):
+                bad.append(f'{f.label}: choose one of the options')
+                continue
+            v = str(v)
+        elif f.kind == 'date':
+            if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', str(v)):
+                bad.append(f'{f.label} must be a date')
+                continue
+        elif f.kind == 'url':
+            if not re.match(r'^https?://[^\s]+$', str(v)):
+                bad.append(f'{f.label} must be a web address starting with http:// or https://')
+                continue
+        else:
+            v = str(v)[:5000 if f.kind == 'textarea' else 500]
+        out[f.key] = v
+    if missing:
+        raise HTTPException(422, 'Please complete the required fields: ' + ', '.join(missing) + '.')
+    if bad:
+        raise HTTPException(422, '; '.join(bad) + '.')
+    return out
+
+
+def notify_user(s: Session, inst_id: str, user_id: int, kind: str, message: str, subject: str):
+    s.add(Notification(institution_id=inst_id, user_id=user_id, kind=kind, message=message))
+    target = s.get(User, user_id)
+    if target and target.active:
+        queue_alert(s, target, subject, message)
+
+
+class FormFieldRequest(BaseModel):
+    key: str = Field(min_length=2, max_length=60, pattern=r'^[a-z][a-z0-9_]*$')
+    label: str = Field(min_length=2, max_length=200)
+    help: str = Field(default='', max_length=1000)
+    kind: str = 'text'
+    options: list[str] = Field(default_factory=list, max_length=50)
+    required: bool = False
+    sort: int = Field(default=100, ge=0, le=10000)
+    enabled: bool = True
+
+
+class FaqRequest(BaseModel):
+    category: str = Field(default='General', min_length=1, max_length=80)
+    question: str = Field(min_length=5, max_length=300)
+    answer: str = Field(min_length=5, max_length=5000)
+    sort: int = Field(default=100, ge=0, le=10000)
+    published: bool = True
+
+
+class ContactRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=200)
+    purpose: str = Field(default='', max_length=1000)
+    phone: str = Field(default='', max_length=120)
+    email: str = Field(default='', max_length=200)
+    website: str = Field(default='', max_length=200)
+    address: str = Field(default='', max_length=300)
+    sort: int = Field(default=100, ge=0, le=10000)
+    published: bool = True
+
+
+class TicketRequest(BaseModel):
+    category: str = Field(min_length=1, max_length=60)
+    subject: str = Field(min_length=3, max_length=200)
+    message: str = Field(min_length=10, max_length=5000)
+    application_id: str | None = None
+
+
+class TicketReply(BaseModel):
+    response: str = Field(min_length=2, max_length=5000)
+
+
+def faq_dict(f: FaqItem) -> dict:
+    return {'id': f.id, 'category': f.category, 'question': f.question, 'answer': f.answer, 'sort': f.sort,
+            'published': f.published, 'updated_at': iso(f.updated_at)}
+
+
+def contact_dict(c: Contact) -> dict:
+    return {'id': c.id, 'name': c.name, 'purpose': c.purpose, 'phone': c.phone, 'email': c.email, 'website': c.website,
+            'address': c.address, 'sort': c.sort, 'published': c.published, 'updated_at': iso(c.updated_at)}
+
+
+@app.get('/api/public/help')
+def public_help(s: Session = Depends(db)):
+    """Everything on the Help page. Open to everyone, including people who have not signed in yet."""
+    inst = default_institution(s)
+    c = content_map(s, inst.id)
+    faqs = s.scalars(select(FaqItem).where(FaqItem.institution_id == inst.id, FaqItem.published == True)  # noqa: E712
+                     .order_by(FaqItem.sort, FaqItem.question)).all()
+    contacts = s.scalars(select(Contact).where(Contact.institution_id == inst.id, Contact.published == True)  # noqa: E712
+                         .order_by(Contact.sort, Contact.name)).all()
+    return {'content': {k: c[k] for k in PUBLIC_CONTENT}, 'support_categories': support_categories(s, inst.id),
+            'faqs': [faq_dict(f) for f in faqs], 'contacts': [contact_dict(x) for x in contacts]}
+
+
+@app.get('/api/admin/content')
+def get_content(u: User = Depends(require_roles('admin')), s: Session = Depends(db)):
+    return content_map(s, u.institution_id)
+
+
+@app.put('/api/admin/content')
+def set_content(req: dict, u: User = Depends(require_roles('admin')), s: Session = Depends(db)):
+    unknown = [k for k in req if k not in CONTENT_DEFAULTS]
+    if unknown:
+        raise HTTPException(422, 'Unknown setting: ' + ', '.join(unknown))
+    clean = {}
+    for k, v in req.items():
+        if k == 'support_categories':
+            cats = v if isinstance(v, list) else jl(str(v), None)
+            ok = isinstance(cats, list) and 0 < len(cats) <= 20 and all(
+                isinstance(x, dict) and re.fullmatch(r'[a-z][a-z0-9_]{1,30}', str(x.get('key', '')))
+                and 2 <= len(str(x.get('label', '')).strip()) <= 120 and isinstance(x.get('days'), int) and 0 <= x['days'] <= 30
+                for x in cats)
+            if not ok or not isinstance(cats, list) or len({x['key'] for x in cats}) != len(cats):
+                raise HTTPException(422, 'Each support category needs a unique key, a label and a reply time of 0-30 working days.')
+            clean[k] = json.dumps([{'key': x['key'], 'label': str(x['label']).strip(), 'days': x['days']} for x in cats])
+        else:
+            text_v = str(v if v is not None else '').strip()
+            if len(text_v) > 4000:
+                raise HTTPException(422, f'{k} is too long (4000 characters at most).')
+            if k == 'support_email' and text_v and not MSG.valid_email(text_v):
+                raise HTTPException(422, 'Please enter a valid support email address.')
+            clean[k] = text_v
+    rows = {r.key: r for r in s.scalars(select(SiteContent).where(SiteContent.institution_id == u.institution_id)).all()}
+    for k, v in clean.items():
+        r = rows.get(k) or SiteContent(institution_id=u.institution_id, key=k)
+        r.value, r.updated_by = v, u.id
+        s.add(r)
+    audit(s, u.institution_id, u.id, 'update_content', 'site_content', ','.join(sorted(clean)))
+    s.commit()
+    return content_map(s, u.institution_id)
+
+
+@app.get('/api/form-fields')
+def list_form_fields(include_disabled: bool = False, u: User = Depends(current_user), s: Session = Depends(db)):
+    q = select(FormField).where(FormField.institution_id == u.institution_id)
+    if not (include_disabled and u.role == 'admin'):
+        q = q.where(FormField.enabled == True)  # noqa: E712
+    return [field_dict(f) for f in s.scalars(q.order_by(FormField.sort, FormField.label)).all()]
+
+
+def _check_field(req: FormFieldRequest) -> list[str]:
+    if req.kind not in FIELD_KINDS:
+        raise HTTPException(422, 'kind must be one of ' + ', '.join(FIELD_KINDS))
+    opts = [o.strip() for o in req.options if o.strip()]
+    if req.kind == 'select' and len(opts) < 2:
+        raise HTTPException(422, 'A choice question needs at least two options.')
+    if any(len(o) > 120 for o in opts):
+        raise HTTPException(422, 'Options must be 120 characters or fewer.')
+    return opts if req.kind == 'select' else []
+
+
+@app.post('/api/form-fields')
+def create_form_field(req: FormFieldRequest, u: User = Depends(require_roles('admin')), s: Session = Depends(db)):
+    opts = _check_field(req)
+    if req.key in IDEA_TEXT_FIELDS or s.scalar(select(FormField).where(FormField.institution_id == u.institution_id,
+                                                                     FormField.key == req.key)):
+        raise HTTPException(409, 'A question with that key already exists.')
+    f = FormField(id=new_id(), institution_id=u.institution_id, key=req.key, label=req.label.strip(), help=req.help.strip(),
+                  kind=req.kind, options_json=json.dumps(opts), required=req.required, sort=req.sort, enabled=req.enabled)
+    s.add(f)
+    audit(s, u.institution_id, u.id, 'create_form_field', 'form_field', f.id, json.dumps({'key': f.key, 'label': f.label}))
+    s.commit()
+    return field_dict(f)
+
+
+@app.put('/api/form-fields/{field_id}')
+def update_form_field(field_id: str, req: FormFieldRequest, u: User = Depends(require_roles('admin')), s: Session = Depends(db)):
+    f = s.get(FormField, field_id)
+    if not f or f.institution_id != u.institution_id:
+        raise HTTPException(404, 'Question not found')
+    if req.key != f.key:
+        raise HTTPException(409, 'The key of a question cannot change, because saved answers use it. Add a new question instead.')
+    opts = _check_field(req)
+    f.label, f.help, f.kind, f.options_json = req.label.strip(), req.help.strip(), req.kind, json.dumps(opts)
+    f.required, f.sort, f.enabled = req.required, req.sort, req.enabled
+    audit(s, u.institution_id, u.id, 'update_form_field', 'form_field', f.id, json.dumps({'key': f.key, 'enabled': f.enabled}))
+    s.commit()
+    return field_dict(f)
+
+
+def _crud_get(s: Session, model, item_id: str, u: User):
+    x = s.get(model, item_id)
+    if not x or x.institution_id != u.institution_id:
+        raise HTTPException(404, 'Not found')
+    return x
+
+
+@app.get('/api/admin/faqs')
+def admin_faqs(u: User = Depends(require_roles('admin')), s: Session = Depends(db)):
+    return [faq_dict(f) for f in s.scalars(select(FaqItem).where(FaqItem.institution_id == u.institution_id)
+                                           .order_by(FaqItem.sort, FaqItem.question)).all()]
+
+
+@app.post('/api/faqs')
+def create_faq(req: FaqRequest, u: User = Depends(require_roles('admin')), s: Session = Depends(db)):
+    f = FaqItem(id=new_id(), institution_id=u.institution_id, **{k: (v.strip() if isinstance(v, str) else v) for k, v in req.model_dump().items()})
+    s.add(f)
+    audit(s, u.institution_id, u.id, 'create_faq', 'faq', f.id, f.question)
+    s.commit()
+    return faq_dict(f)
+
+
+@app.put('/api/faqs/{faq_id}')
+def update_faq(faq_id: str, req: FaqRequest, u: User = Depends(require_roles('admin')), s: Session = Depends(db)):
+    f = _crud_get(s, FaqItem, faq_id, u)
+    for k, v in req.model_dump().items():
+        setattr(f, k, v.strip() if isinstance(v, str) else v)
+    audit(s, u.institution_id, u.id, 'update_faq', 'faq', f.id, f.question)
+    s.commit()
+    return faq_dict(f)
+
+
+@app.delete('/api/faqs/{faq_id}')
+def delete_faq(faq_id: str, u: User = Depends(require_roles('admin')), s: Session = Depends(db)):
+    f = _crud_get(s, FaqItem, faq_id, u)
+    audit(s, u.institution_id, u.id, 'delete_faq', 'faq', f.id, f.question)
+    s.delete(f)
+    s.commit()
+    return {'deleted': faq_id}
+
+
+@app.get('/api/admin/contacts')
+def admin_contacts(u: User = Depends(require_roles('admin')), s: Session = Depends(db)):
+    return [contact_dict(c) for c in s.scalars(select(Contact).where(Contact.institution_id == u.institution_id)
+                                               .order_by(Contact.sort, Contact.name)).all()]
+
+
+def _contact_values(req: ContactRequest) -> dict:
+    d = {k: (v.strip() if isinstance(v, str) else v) for k, v in req.model_dump().items()}
+    if d['email'] and not MSG.valid_email(d['email']):
+        raise HTTPException(422, 'Please enter a valid email address.')
+    if d['website'] and not re.match(r'^https?://[^\s]+$', d['website']):
+        raise HTTPException(422, 'The website must start with http:// or https://')
+    return d
+
+
+@app.post('/api/contacts')
+def create_contact(req: ContactRequest, u: User = Depends(require_roles('admin')), s: Session = Depends(db)):
+    c = Contact(id=new_id(), institution_id=u.institution_id, **_contact_values(req))
+    s.add(c)
+    audit(s, u.institution_id, u.id, 'create_contact', 'contact', c.id, c.name)
+    s.commit()
+    return contact_dict(c)
+
+
+@app.put('/api/contacts/{contact_id}')
+def update_contact(contact_id: str, req: ContactRequest, u: User = Depends(require_roles('admin')), s: Session = Depends(db)):
+    c = _crud_get(s, Contact, contact_id, u)
+    for k, v in _contact_values(req).items():
+        setattr(c, k, v)
+    audit(s, u.institution_id, u.id, 'update_contact', 'contact', c.id, c.name)
+    s.commit()
+    return contact_dict(c)
+
+
+@app.delete('/api/contacts/{contact_id}')
+def delete_contact(contact_id: str, u: User = Depends(require_roles('admin')), s: Session = Depends(db)):
+    c = _crud_get(s, Contact, contact_id, u)
+    audit(s, u.institution_id, u.id, 'delete_contact', 'contact', c.id, c.name)
+    s.delete(c)
+    s.commit()
+    return {'deleted': contact_id}
+
+
+def ticket_dict(s: Session, t: SupportTicket, cats: dict) -> dict:
+    who = s.get(User, t.user_id)
+    responder = s.get(User, t.responded_by) if t.responded_by else None
+    return {'id': t.id, 'category': t.category, 'category_label': cats.get(t.category, t.category), 'subject': t.subject,
+            'message': t.message, 'status': t.status, 'application_id': t.application_id,
+            'created_at': iso(t.created_at), 'due_at': iso(t.due_at), 'overdue': t.status == 'open' and utcnow() > t.due_at,
+            'response': t.response, 'responded_at': iso(t.responded_at),
+            'responded_by': responder.full_name or responder.username if responder else None,
+            'user': (who.full_name or who.username) if who else None}
+
+
+@app.get('/api/support/tickets')
+def list_tickets(status: str | None = None, u: User = Depends(current_user), s: Session = Depends(db)):
+    """Submitters see their own requests; support staff see everyone's, oldest open first."""
+    q = select(SupportTicket).where(SupportTicket.institution_id == u.institution_id)
+    if u.role not in SUPPORT_ROLES:
+        q = q.where(SupportTicket.user_id == u.id)
+    if status:
+        q = q.where(SupportTicket.status == status)
+    rows = s.scalars(q.order_by(SupportTicket.created_at.desc()).limit(300)).all()
+    cats = {c['key']: c['label'] for c in support_categories(s, u.institution_id)}
+    items = [ticket_dict(s, t, cats) for t in rows]
+    out: dict = {'items': items, 'categories': support_categories(s, u.institution_id)}
+    if u.role in SUPPORT_ROLES:
+        answered = [t for t in rows if t.responded_at]
+        out['stats'] = {'open': sum(1 for t in rows if t.status == 'open'), 'overdue': sum(1 for i in items if i['overdue']),
+                        'answered': len(answered),
+                        'answered_on_time': sum(1 for t in answered if t.responded_at <= t.due_at)}
+    return out
+
+
+@app.post('/api/support/tickets')
+def create_ticket(req: TicketRequest, u: User = Depends(current_user), s: Session = Depends(db)):
+    if not rate_ok(f'ticket:{u.id}', 10, 3600):
+        raise HTTPException(429, 'You have sent a lot of requests in the last hour. Please wait a little.')
+    cats = {c['key']: c for c in support_categories(s, u.institution_id)}
+    cat = cats.get(req.category)
+    if not cat:
+        raise HTTPException(422, 'Please choose what your question is about.')
+    if req.application_id:
+        get_app_or_404(s, req.application_id, u)
+    now = utcnow()
+    t = SupportTicket(id=new_id(), institution_id=u.institution_id, user_id=u.id, application_id=req.application_id,
+                      category=req.category, subject=req.subject.strip(), message=req.message.strip(),
+                      due_at=add_working_days(now, cat['days']) if cat['days'] else now + timedelta(hours=4), created_at=now)
+    s.add(t)
+    for sid in staff_ids(s, u.institution_id, SUPPORT_ROLES, u.id):
+        notify_user(s, u.institution_id, sid, 'support', f'New support request: {t.subject}', 'New support request')
+    audit(s, u.institution_id, u.id, 'create_ticket', 'support_ticket', t.id, t.subject)
+    s.commit()
+    return ticket_dict(s, t, {k: v['label'] for k, v in cats.items()})
+
+
+@app.post('/api/support/tickets/{ticket_id}/reply')
+def reply_ticket(ticket_id: str, req: TicketReply, u: User = Depends(require_roles(*SUPPORT_ROLES)), s: Session = Depends(db)):
+    t = _crud_get(s, SupportTicket, ticket_id, u)
+    if t.status == 'closed':
+        raise HTTPException(409, 'This request is closed.')
+    t.response, t.responded_by, t.responded_at, t.status = req.response.strip(), u.id, utcnow(), 'answered'
+    notify_user(s, u.institution_id, t.user_id, 'support', f'We replied to your support request "{t.subject}": {t.response[:400]}',
+                'Reply to your support request')
+    audit(s, u.institution_id, u.id, 'reply_ticket', 'support_ticket', t.id)
+    s.commit()
+    cats = {c['key']: c['label'] for c in support_categories(s, u.institution_id)}
+    return ticket_dict(s, t, cats)
+
+
+@app.post('/api/support/tickets/{ticket_id}/close')
+def close_ticket(ticket_id: str, u: User = Depends(current_user), s: Session = Depends(db)):
+    t = _crud_get(s, SupportTicket, ticket_id, u)
+    if t.user_id != u.id and u.role not in SUPPORT_ROLES:
+        raise HTTPException(404, 'Not found')
+    t.status = 'closed'
+    audit(s, u.institution_id, u.id, 'close_ticket', 'support_ticket', t.id)
+    s.commit()
+    cats = {c['key']: c['label'] for c in support_categories(s, u.institution_id)}
+    return ticket_dict(s, t, cats)
 
 
 @app.get('/api/audit')

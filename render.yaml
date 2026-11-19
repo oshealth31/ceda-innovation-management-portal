@@ -29,3 +29,17 @@ services:
         sync: false
       - key: DEFAULT_INSTITUTION_NAME
         value: CEDA Innovation Management Portal (Prototype)
+      - key: PORTAL_URL
+        value: https://ceda-innovation-portal.onrender.com
+      # Until an email service is connected, sign-up and reset codes are shown on screen so the demo can be tried.
+      # Set to "false" as soon as BREVO_API_KEY (or SMTP_HOST) is filled in.
+      - key: DEMO_SHOW_CODES
+        value: "true"
+      - key: BREVO_API_KEY
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      - key: SMS_API_URL
+        sync: false
+      - key: SMS_API_KEY
+        sync: false
