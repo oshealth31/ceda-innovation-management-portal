@@ -159,6 +159,9 @@ class User(Base):
     gender: Mapped[str] = mapped_column(String(20), default='')
     birth_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
     district: Mapped[str] = mapped_column(String(80), default='')
+    # Live chat (1.6): staff the administrator marks as chat consultants, and when they were last on the chat console
+    chat_agent: Mapped[bool] = mapped_column(Boolean, default=False)
+    chat_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class OneTimeCode(Base):
@@ -514,6 +517,7 @@ USER_COLUMNS_14 = {  # added in 1.4; existing databases get them in place, with 
     'email_verified': ('BOOLEAN', True), 'pending_email': ('VARCHAR(200)', None), 'otp_login': ('BOOLEAN', False),
     'alert_email': ('BOOLEAN', True), 'alert_sms': ('BOOLEAN', False),
     'gender': ("VARCHAR(20) DEFAULT ''", None), 'birth_year': ('INTEGER', None), 'district': ("VARCHAR(80) DEFAULT ''", None),
+    'chat_agent': ('BOOLEAN', False), 'chat_seen_at': ('TIMESTAMP', None),
 }
 GENDERS = ('female', 'male', 'other', 'prefer_not')
 DISTRICTS = ('Gaborone', 'Francistown', 'Lobatse', 'Selebi-Phikwe', 'Jwaneng', 'Orapa', 'Sowa Town', 'Central', 'Chobe',
@@ -926,6 +930,7 @@ class UserUpdate(BaseModel):
     active: bool | None = None
     role: str | None = None
     password: str | None = None
+    chat_agent: bool | None = None
 
 
 class ProgramRequest(BaseModel):
@@ -1550,6 +1555,7 @@ def auth_options():
 def me(u: User = Depends(current_user), s: Session = Depends(db)):
     inst = s.get(Institution, u.institution_id)
     return {'id': u.id, 'username': u.username, 'role': u.role, 'full_name': u.full_name,
+            'chat_agent': bool(u.chat_agent and u.role in STAFF),
             'institution': {'id': inst.id, 'name': inst.name, 'code': inst.code, 'ai_enabled': inst.ai_enabled}}
 
 
@@ -1644,7 +1650,8 @@ def change_password(req: PasswordChange, u: User = Depends(current_user), s: Ses
 
 def user_dict(x: User) -> dict:
     return {'id': x.id, 'username': x.username, 'role': x.role, 'active': x.active, 'created_at': iso(x.created_at),
-            'full_name': x.full_name, 'email': x.email, 'phone': x.phone, 'email_verified': x.email_verified}
+            'full_name': x.full_name, 'email': x.email, 'phone': x.phone, 'email_verified': x.email_verified,
+            'chat_agent': x.chat_agent}
 
 
 @app.get('/api/users')
@@ -1689,7 +1696,12 @@ def update_user(user_id: int, req: UserUpdate, u: User = Depends(require_roles('
     if req.password:
         check_password_policy(req.password, x.username)
         x.password_hash, changes['password'] = hash_password(req.password), 'reset'
-    x.token_version += 1
+    if req.chat_agent is not None:
+        if req.chat_agent and x.role not in STAFF:
+            raise HTTPException(422, 'Only staff accounts can be chat consultants.')
+        x.chat_agent, changes['chat_agent'] = req.chat_agent, req.chat_agent
+    if set(changes) - {'chat_agent'}:
+        x.token_version += 1  # signs the person out when their access changes
     audit(s, u.institution_id, u.id, 'update', 'user', x.id, json.dumps(changes))
     s.commit()
     return user_dict(x)
@@ -2523,6 +2535,12 @@ CONTENT_DEFAULTS = {
     'portal_name': 'CEDA Innovation Management Portal',
     'theme_primary': '#1e5eff',   # buttons, links, charts
     'theme_sidebar': '#10243f',   # menu and headings
+    # Live chat (1.6). Times are Botswana time; closed dates are public holidays, one YYYY-MM-DD per line.
+    'chat_open': '09:00',
+    'chat_close': '16:00',
+    'chat_closed_dates': '',
+    'chat_away_message': ('Live chat is open Monday to Friday, 09:00 to 16:00, except public holidays. Leave us a message '
+                          'and we will reply within the time shown on the Support page.'),
 }
 PUBLIC_CONTENT = ('announcement', 'welcome', 'support_intro', 'support_hours', 'support_email', 'support_phone',
                   'portal_name', 'theme_primary', 'theme_sidebar')
@@ -2770,6 +2788,10 @@ def set_content(req: dict, u: User = Depends(require_roles('admin')), s: Session
     if unknown:
         raise HTTPException(422, 'Unknown setting: ' + ', '.join(unknown))
     clean = {}
+    if 'chat_open' in req or 'chat_close' in req:
+        cur = content_map(s, u.institution_id)
+        if str(req.get('chat_open', cur['chat_open'])) >= str(req.get('chat_close', cur['chat_close'])):
+            raise HTTPException(422, 'Chat must open before it closes.')
     for k, v in req.items():
         if k == 'support_categories':
             cats = v if isinstance(v, list) else jl(str(v), None)
@@ -2793,6 +2815,16 @@ def set_content(req: dict, u: User = Depends(require_roles('admin')), s: Session
                 if contrast_with_white(text_v) < 4.5:
                     raise HTTPException(422, f'White text on {text_v} would be hard to read (contrast {contrast_with_white(text_v)}:1, '
                                              'needs 4.5:1). Choose a darker shade.')
+            if k in ('chat_open', 'chat_close') and not re.fullmatch(r'([01]\d|2[0-3]):[0-5]\d', text_v):
+                raise HTTPException(422, 'Chat hours must look like 09:00.')
+            if k == 'chat_closed_dates':
+                days = [x.strip() for x in re.split(r'[\s,]+', text_v) if x.strip()]
+                for x in days:
+                    try:
+                        datetime.strptime(x, '%Y-%m-%d')
+                    except ValueError:
+                        raise HTTPException(422, f'"{x}" is not a date. Use one date per line, like 2026-12-25.')
+                text_v = '\n'.join(days)
             if k == 'portal_name' and not 3 <= len(text_v) <= 80:
                 raise HTTPException(422, 'The portal name must be 3 to 80 characters.')
             clean[k] = text_v
@@ -3074,9 +3106,10 @@ def pilot_summary(u: User = Depends(require_roles(*STAFF)), s: Session = Depends
 
 
 # Feature modules. Imported here, after the models and helpers they use are defined.
-from . import reports  # noqa: E402
+from . import chat, reports  # noqa: E402
 
 app.include_router(reports.router)
+app.include_router(chat.router)
 
 # Static frontend is mounted last so /api/* routes take precedence.
 app.mount('/', StaticFiles(directory=ROOT / 'frontend', html=True), name='frontend')

@@ -712,6 +712,88 @@ class ApiScenario(unittest.TestCase):
         self.assertGreaterEqual(M.contrast_with_white('#1e5eff'), 4.5)
         self.assertLess(M.contrast_with_white('#ffcc00'), 4.5)
 
+    # ---- 33 live chat: hours, consultants, queue, hand-over, missed chats and analytics
+    def test_33_live_chat(self):
+        from datetime import datetime as dt, timedelta as td
+        C = M.chat
+        c = M.CONTENT_DEFAULTS
+        self.assertFalse(C.hours_state(c, dt(2026, 11, 21, 8, 0))[0])           # Saturday
+        self.assertFalse(C.hours_state(c, dt(2026, 11, 16, 6, 30))[0])          # Monday 08:30 Botswana time
+        self.assertTrue(C.hours_state(c, dt(2026, 11, 16, 8, 0))[0])            # Monday 10:00
+        self.assertFalse(C.hours_state(c, dt(2026, 11, 16, 14, 0))[0])          # Monday 16:00 - closed
+        self.assertEqual(C.hours_state({**c, 'chat_closed_dates': '2026-11-16'}, dt(2026, 11, 16, 8, 0)), (False, 'public holiday'))
+        real = C.hours_state
+        C.hours_state = lambda cc, now=None: (True, '')
+        try:
+            h, ad, o, cm = self.ids['neo'], self.ids['admin'], self.ids['officer'], self.ids['committee']
+            ad_id, o_id, neo_id = self.user_id('admin'), self.user_id('officer1'), self.user_id('neo.m')
+            self.assertEqual(self.c.patch(f'/api/users/{neo_id}', headers=ad, json={'chat_agent': True}).status_code, 422)
+            self.assertEqual(self.c.patch(f'/api/users/{o_id}', headers=ad, json={'chat_agent': True}).status_code, 200)
+            self.assertEqual(self.c.get('/api/me', headers=o).status_code, 200)  # not signed out by the change
+            self.assertTrue(self.c.get('/api/me', headers=o).json()['chat_agent'])
+            st = self.c.get('/api/chat/status', headers=h).json()
+            self.assertEqual((st['open'], st['reason']), (False, 'no consultant online'))
+            r = self.c.post('/api/chat/sessions', headers=h, json={'topic': 'Upload', 'message': 'Hello, can you help?'})
+            self.assertEqual(r.status_code, 409)
+            self.assertTrue(r.json()['detail']['away'])
+            r = self.c.post('/api/chat/leave-message', headers=h, json={'subject': 'Chat question', 'message': 'Please call me back about my idea.'})
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(self.c.get('/api/chat/queue', headers=h).status_code, 403)
+            self.assertEqual(self.c.get('/api/chat/queue', headers=o).status_code, 200)  # consultant is now online
+            self.assertTrue(self.c.get('/api/chat/status', headers=h).json()['open'])
+            s1 = self.c.post('/api/chat/sessions', headers=h, json={'topic': 'Upload', 'message': 'My PDF will not upload.'}).json()
+            self.assertEqual((s1['status'], s1['queue_position']), ('waiting', 1))
+            self.assertEqual(self.c.post('/api/chat/sessions', headers=h, json={'message': 'again?'}).json()['id'], s1['id'])
+            q = self.c.get('/api/chat/queue', headers=o).json()
+            self.assertEqual([x['id'] for x in q['waiting']], [s1['id']])
+            self.assertEqual(self.c.post(f"/api/chat/sessions/{s1['id']}/claim", headers=cm).status_code, 403)
+            self.assertEqual(self.c.post(f"/api/chat/sessions/{s1['id']}/messages", headers=o, json={'body': 'hi'}).status_code, 409)
+            r = self.c.post(f"/api/chat/sessions/{s1['id']}/claim", headers=o)
+            self.assertEqual(r.json()['status'], 'active')
+            self.assertEqual(self.c.post(f"/api/chat/sessions/{s1['id']}/claim", headers=o).status_code, 409)
+            last = r.json()['messages'][-1]['id']
+            self.c.post(f"/api/chat/sessions/{s1['id']}/messages", headers=o, json={'body': 'Is it a scanned PDF?'})
+            self.c.post(f"/api/chat/sessions/{s1['id']}/messages", headers=h, json={'body': 'Yes it is.'})
+            new = self.c.get(f"/api/chat/sessions/{s1['id']}?after={last}", headers=h).json()['messages']
+            self.assertEqual([(m['sender'], m['body']) for m in new], [('agent', 'Is it a scanned PDF?'), ('user', 'Yes it is.')])
+            self.assertTrue(new[1]['own'])
+            other = self.login('other.sub')
+            self.assertEqual(self.c.get(f"/api/chat/sessions/{s1['id']}", headers=other).status_code, 404)
+            # hand over to the administrator
+            self.assertEqual(self.c.post(f"/api/chat/sessions/{s1['id']}/transfer", headers=o, json={'agent_id': ad_id}).status_code, 422)
+            self.c.patch(f'/api/users/{ad_id}', headers=ad, json={'chat_agent': True})
+            r = self.c.post(f"/api/chat/sessions/{s1['id']}/transfer", headers=o, json={'agent_id': ad_id})
+            self.assertEqual(r.json()['agent_id'], ad_id)
+            self.assertEqual(self.c.post(f"/api/chat/sessions/{s1['id']}/messages", headers=o, json={'body': 'still me'}).status_code, 409)
+            self.assertEqual(self.c.post(f"/api/chat/sessions/{s1['id']}/rate", headers=h, json={'rating': 5}).status_code, 409)
+            self.assertEqual(self.c.post(f"/api/chat/sessions/{s1['id']}/close", headers=h).json()['status'], 'closed')
+            self.assertEqual(self.c.post(f"/api/chat/sessions/{s1['id']}/messages", headers=h, json={'body': 'x'}).status_code, 409)
+            self.assertEqual(self.c.post(f"/api/chat/sessions/{s1['id']}/rate", headers=h, json={'rating': 5}).status_code, 200)
+            # a chat nobody takes becomes a support request
+            s2 = self.c.post('/api/chat/sessions', headers=other, json={'topic': 'Deadline', 'message': 'When is the deadline?'}).json()
+            with M.SessionLocal() as db:
+                row = db.get(C.ChatSession, s2['id'])
+                row.created_at = M.utcnow() - td(minutes=C.MISSED_MINUTES + 1)
+                db.commit()
+            got = self.c.get(f"/api/chat/sessions/{s2['id']}", headers=other).json()
+            self.assertEqual(got['status'], 'missed')
+            self.assertTrue(got['ticket_id'])
+            tickets = self.c.get('/api/support/tickets', headers=other).json()['items']
+            self.assertIn('When is the deadline?', [t['message'] for t in tickets])
+            a = self.c.get('/api/chat/analytics', headers=ad).json()
+            self.assertEqual((a['chats'], a['answered'], a['missed'], a['average_rating']), (2, 1, 1, 5.0))
+            self.assertEqual(a['by_agent'][0]['chats'], 1)
+            self.assertEqual(self.c.get('/api/chat/analytics', headers=h).status_code, 403)
+            # chat hours are validated
+            self.assertEqual(self.c.put('/api/admin/content', headers=ad, json={'chat_open': '9am'}).status_code, 422)
+            self.assertEqual(self.c.put('/api/admin/content', headers=ad, json={'chat_open': '17:00'}).status_code, 422)
+            self.assertEqual(self.c.put('/api/admin/content', headers=ad, json={'chat_closed_dates': '25 Dec'}).status_code, 422)
+            self.assertEqual(self.c.put('/api/admin/content', headers=ad, json={'chat_closed_dates': '2026-12-25, 2026-12-26'}).json()['chat_closed_dates'],
+                             '2026-12-25\n2026-12-26')
+            self.assertEqual(self.c.post('/api/chat/offline', headers=o).status_code, 200)
+        finally:
+            C.hours_state = real
+
 
 if __name__ == '__main__':
     unittest.main()

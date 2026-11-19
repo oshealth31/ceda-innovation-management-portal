@@ -81,6 +81,7 @@ const NAV = [
   ['reports', 'Reports', ['admin', 'officer', 'committee']],
   ['notifications', 'Notifications', ['admin', 'officer', 'committee', 'applicant']],
   ['support', 'Support', ['admin', 'officer', 'committee', 'applicant']],
+  ['chat', 'Live chat', ['admin', 'officer', 'committee']],
   ['help', 'Help and FAQs', ['admin', 'officer', 'committee', 'applicant']],
   ['content', 'Site content', ['admin']],
   ['formbuilder', 'Application form', ['admin']],
@@ -97,6 +98,7 @@ const EDITABLE = ['draft', 'under_review', 'request_information'];
 /* ---------- API ---------- */
 function errText(j, status) {
   if (j && Array.isArray(j.detail)) return j.detail.map((d) => `${(d.loc || []).slice(1).join('.')}: ${d.msg}`).join('; ');
+  if (j && j.detail && typeof j.detail === 'object') return j.detail.message || `Request failed (${status})`;
   return (j && j.detail) || `Request failed (${status})`;
 }
 async function api(path, opt = {}) {
@@ -106,7 +108,7 @@ async function api(path, opt = {}) {
   let j = null;
   if ((r.headers.get('content-type') || '').includes('json')) { try { j = await r.json(); } catch (e) { /* ignore */ } }
   if (r.status === 401 && token) { logout(); throw new Error((j && j.detail) || 'Session expired - please sign in again'); }
-  if (!r.ok) throw new Error(errText(j, r.status));
+  if (!r.ok) throw Object.assign(new Error(errText(j, r.status)), { data: j, status: r.status });
   return j;
 }
 const send = (path, body, method = 'POST') => api(path, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -138,7 +140,7 @@ async function boot() {
     me = await api('/api/me');
     $('login').classList.add('hidden'); $('portal').classList.remove('hidden');
     $('userInfo').textContent = `${me.username} - ${roleLabel(me.role)} - ${me.institution.name}`;
-    const mine = new Map(NAV.filter((n) => n[2].includes(me.role)).map((n) => [n[0], n]));
+    const mine = new Map(NAV.filter((n) => n[2].includes(me.role) && (n[0] !== 'chat' || me.chat_agent || me.role === 'admin')).map((n) => [n[0], n]));
     const btn = (n) => `<button class="nav" data-action="nav" data-page="${n[0]}">${icon(n[0])}<span>${esc(n[1])}</span></button>`;
     const placed = new Set();
     let html = NAV_SECTIONS.map(([title, ids]) => {
@@ -149,21 +151,23 @@ async function boot() {
     $('nav').innerHTML = html;
     try { const h = await fetch('/api/health'); $('ver').textContent = 'v' + (await h.json()).version; } catch (e) { /* ignore */ }
     await Promise.all([loadSite(), loadFormFields()]);
+    chatInit();
     show('dashboard');
   } catch (e) { /* api() already logged out on 401 */ }
 }
 function logout() {
-  token = ''; me = null; current = null; sessionStorage.removeItem('fl_token');
+  token = ''; me = null; current = null; sessionStorage.removeItem('fl_token'); chatReset();
   $('portal').classList.add('hidden'); $('login').classList.remove('hidden');
 }
 async function show(id) {
   page = id;
+  if (id !== 'chat') stopConsole();
   document.querySelectorAll('.nav').forEach((x) => x.classList.toggle('active', x.dataset.page === id));
   $('title').textContent = TITLES[id] || 'CEDA Innovation Management Portal';
   setMenu(false);
   $('page').innerHTML = '<div class="empty">Loading...</div>';
   try { await ({ dashboard: pDashboard, applications: pApplications, new: pNew, review: pReview, committee: pCommittee, scoring: pScoring, standards: pStandards,
-    programmes: pProgrammes, knowledge: pKnowledge, management: pManagement, reports: pReports, notifications: pNotifications, users: pUsers, audit: pAudit, messages: pMessages, settings: pSettings, support: pSupport, help: pHelp, content: pContent, formbuilder: pFormBuilder }[id])(); }
+    programmes: pProgrammes, knowledge: pKnowledge, management: pManagement, reports: pReports, notifications: pNotifications, users: pUsers, audit: pAudit, messages: pMessages, settings: pSettings, support: pSupport, chat: pChatConsole, help: pHelp, content: pContent, formbuilder: pFormBuilder }[id])(); }
   catch (e) { $('page').innerHTML = `<div class="card bad">${esc(e.message)}</div>`; }
 }
 
@@ -476,8 +480,8 @@ async function pNotifications() {
 }
 async function pUsers() {
   const rows = await api('/api/users');
-  $('page').innerHTML = `<div class="card"><h2>Users</h2><div class="table-wrap"><table class="table"><thead><tr><th>Username</th><th>Role</th><th>Status</th><th>Created</th><th></th></tr></thead><tbody>${rows.map((u) => `<tr><td>${esc(u.username)}</td><td>${esc(roleLabel(u.role))}</td><td>${u.active ? pill('active', 'good') : pill('inactive', 'bad')}</td><td>${esc(when(u.created_at))}</td>
-    <td>${u.id === me.id ? '' : `<button class="small ghost" data-action="user-toggle" data-id="${u.id}" data-active="${u.active ? 1 : 0}">${u.active ? 'Deactivate' : 'Activate'}</button> <button class="small ghost" data-action="user-reset" data-id="${u.id}">Reset password</button>`}</td></tr>`).join('')}</tbody></table></div></div>
+  $('page').innerHTML = `<div class="card"><h2>Users</h2><div class="table-wrap"><table class="table"><thead><tr><th>Username</th><th>Role</th><th>Status</th><th>Created</th><th></th></tr></thead><tbody>${rows.map((u) => `<tr><td>${esc(u.username)}</td><td>${esc(roleLabel(u.role))}</td><td>${u.active ? pill('active', 'good') : pill('inactive', 'bad')}${u.chat_agent ? ' ' + pill('chat', 'good') : ''}</td><td>${esc(when(u.created_at))}</td>
+    <td>${u.id === me.id ? '' : `<button class="small ghost" data-action="user-toggle" data-id="${u.id}" data-active="${u.active ? 1 : 0}">${u.active ? 'Deactivate' : 'Activate'}</button> <button class="small ghost" data-action="user-reset" data-id="${u.id}">Reset password</button>`}${u.role !== 'applicant' ? ` <button class="small ghost" data-action="user-chat" data-id="${u.id}" data-on="${u.chat_agent ? 1 : 0}">${u.chat_agent ? 'Remove from chat' : 'Make chat consultant'}</button>` : ''}</td></tr>`).join('')}</tbody></table></div></div>
     <div class="card"><h3>Create user</h3><form data-form="user-create"><div class="inline-form"><div class="field"><label>Username</label><input name="username" required minlength="3" pattern="[A-Za-z0-9_.\\-]+"></div>
     <div class="field"><label>Full name</label><input name="full_name" maxlength="200"></div>
     <div class="field"><label>Email</label><input name="email" type="email"></div><div class="field"><label>Mobile</label><input name="phone" type="tel"></div>
@@ -581,6 +585,131 @@ async function pReports() {
     <p class="small muted">Generated ${esc(when(d.generated_at))}.</p>`;
 }
 
+/* ---------- live chat: the chat button for everyone, and the console for consultants ---------- */
+const chat = { open: false, sid: null, after: 0, timer: null, status: null, busy: false };
+const chatTime = (iso) => new Date(iso + (iso && !iso.endsWith('Z') && !iso.includes('+') ? 'Z' : '')).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+function chatReset() { clearInterval(chat.timer); Object.assign(chat, { open: false, sid: null, after: 0, timer: null, status: null }); const b = $('chatDock'); if (b) b.remove(); }
+function chatInit() {
+  chatReset();
+  if (!me || me.chat_agent) return; // consultants use the console page
+  const dock = document.createElement('div'); dock.id = 'chatDock';
+  dock.innerHTML = `<button class="chat-fab" data-action="chat-toggle" aria-label="Live chat" aria-expanded="false">${icon('chat')}<span>Chat</span></button>
+    <section class="chat-panel hidden" id="chatPanel" aria-label="Live chat"><header><b>Live chat</b><span id="chatState" class="small"></span><button class="chat-x" data-action="chat-toggle" aria-label="Close chat">&times;</button></header><div id="chatBody"></div></section>`;
+  document.body.appendChild(dock);
+}
+const bubble = (m) => (m.sender === 'system' ? `<div class="msg sys">${esc(m.body)}</div>`
+  : `<div class="msg ${m.own ? 'me' : 'them'}"><div>${esc(m.body)}</div><span>${m.own ? '' : esc(m.name || '') + ' · '}${esc(chatTime(m.at))}</span></div>`);
+async function chatOpenPanel() {
+  const body = $('chatBody');
+  body.innerHTML = '<div class="empty">Checking...</div>';
+  const st = await api('/api/chat/status'); chat.status = st;
+  $('chatState').innerHTML = st.open ? '<i class="dot on"></i> Online' : '<i class="dot"></i> Closed';
+  if (st.active_session_id) return chatLoad(st.active_session_id);
+  if (!st.open) {
+    body.innerHTML = `<div class="chat-away"><p>${esc(st.away_message)}</p><p class="small muted">Chat hours: ${esc(st.hours)}${st.reason === 'no consultant online' ? '. No consultant is online right now.' : '.'}</p>
+      <form data-form="chat-leave"><div class="field"><label>Subject</label><input name="subject" required minlength="3" maxlength="200"></div>
+      <div class="field"><label>Your message</label><textarea name="message" rows="3" required minlength="10" maxlength="5000"></textarea></div><button type="submit" class="wide">Leave a message</button></form></div>`;
+    return;
+  }
+  body.innerHTML = `<form data-form="chat-start" class="chat-start"><p class="small muted">${st.agents_online} consultant${st.agents_online === 1 ? '' : 's'} online. Ask about your account, your idea or the review.</p>
+    <div class="field"><label>Topic (optional)</label><input name="topic" maxlength="200"></div>
+    <div class="field"><label>Your question</label><textarea name="message" rows="3" required minlength="2" maxlength="2000"></textarea></div><button type="submit" class="wide">${icon('send')} Start chat</button></form>`;
+}
+async function chatLoad(sid) {
+  chat.sid = sid; chat.after = 0;
+  $('chatBody').innerHTML = `<div class="chat-log" id="chatLog" aria-live="polite"></div><div id="chatFoot"></div>`;
+  await chatPoll();
+  clearInterval(chat.timer); chat.timer = setInterval(chatPoll, 3000);
+}
+async function chatPoll() {
+  if (!chat.sid || chat.busy) return;
+  chat.busy = true;
+  try {
+    const d = await api(`/api/chat/sessions/${chat.sid}?after=${chat.after}`);
+    const log = $('chatLog'); if (!log) return;
+    const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+    d.messages.forEach((m) => { log.insertAdjacentHTML('beforeend', bubble(m)); chat.after = Math.max(chat.after, m.id); });
+    if (d.messages.length && (atBottom || chat.after === d.messages[d.messages.length - 1].id)) log.scrollTop = log.scrollHeight;
+    const foot = $('chatFoot');
+    const state = d.status === 'waiting' ? `Waiting for a consultant${d.queue_position ? ` (number ${d.queue_position} in the queue)` : ''}` : d.status === 'active' ? `Chatting with ${esc(d.agent)}` : '';
+    if (d.status === 'waiting' || d.status === 'active') {
+      if (!foot.querySelector('form')) foot.innerHTML = `<div class="small muted" id="chatWho"></div><form data-form="chat-send" class="chat-send"><textarea name="body" rows="1" required maxlength="2000" placeholder="Type a message" aria-label="Message"></textarea><button type="submit" aria-label="Send">${icon('send')}</button></form><button class="link small" data-action="chat-end">End chat</button>`;
+      $('chatWho').innerHTML = state;
+    } else {
+      clearInterval(chat.timer);
+      foot.innerHTML = d.status === 'missed' ? '<p class="small"><a href="#" data-action="nav" data-page="support">Open Support to see the reply</a></p>'
+        : d.rating ? `<p class="small muted">Thanks for rating this chat ${d.rating}/5.</p>`
+          : d.agent_id ? `<div class="rate"><span class="small">How did we do?</span>${[1, 2, 3, 4, 5].map((n) => `<button class="small ghost" data-action="chat-rate" data-n="${n}" aria-label="${n} out of 5">${'★'.repeat(n)}</button>`).join('')}</div>` : '';
+      foot.insertAdjacentHTML('beforeend', '<button class="small ghost" data-action="chat-new">Start a new chat</button>');
+    }
+  } catch (e) { /* keep trying quietly */ } finally { chat.busy = false; }
+}
+
+/* consultant console */
+const con = { timer: null, sid: null, after: 0, busy: false };
+function stopConsole() { clearInterval(con.timer); con.timer = null; }
+const wait = (s) => (s < 60 ? `${s}s` : `${Math.floor(s / 60)} min`);
+async function pChatConsole() {
+  $('page').innerHTML = `<div class="console"><div class="card console-list"><div class="row between"><h2>Live chat</h2><span id="conOnline" class="small"></span></div><div id="conQueue"><div class="empty">Loading...</div></div></div>
+    <div class="card console-chat" id="conChat"><div class="empty">Choose a chat on the left. New chats wait in the queue until a consultant takes them.</div></div></div>
+    <div class="card" id="conStats"></div>`;
+  await consoleTick();
+  stopConsole(); con.timer = setInterval(consoleTick, 4000);
+  loadChatStats();
+}
+async function consoleTick() {
+  if (page !== 'chat' || con.busy) return;
+  con.busy = true;
+  try {
+    const q = await api('/api/chat/queue');
+    $('conOnline').innerHTML = `${q.in_hours ? '' : `<span class="pill warn">closed: ${esc(q.reason)}</span> `}<i class="dot ${q.me_agent ? 'on' : ''}"></i> ${q.online.length} online: ${esc(q.online.map((x) => x.name).join(', ') || 'nobody')}`;
+    const row = (x, action) => `<button class="chat-item ${con.sid === x.id ? 'sel' : ''}" data-action="${action}" data-id="${x.id}"><b>${esc(x.user)}</b> ${x.last_from_user && x.status === 'active' ? pill('new', 'warn') : ''}<span class="small muted">${esc(x.topic || x.last_message)}</span><span class="small">${x.status === 'waiting' ? `waiting ${wait(x.waiting_seconds)}` : esc(x.agent || '')}</span></button>`;
+    $('conQueue').innerHTML = `${q.me_agent ? '' : '<p class="small bad">Your account is not a chat consultant. Mark it on the Users page to take chats.</p>'}
+      <h4>Waiting (${q.waiting.length})</h4>${q.waiting.map((x) => row(x, 'con-open')).join('') || '<div class="small muted">Nobody waiting.</div>'}
+      <h4>My chats (${q.mine.length})</h4>${q.mine.map((x) => row(x, 'con-open')).join('') || '<div class="small muted">None.</div>'}
+      <h4>Other consultants (${q.others.length})</h4>${q.others.map((x) => row(x, 'con-open')).join('') || '<div class="small muted">None.</div>'}`;
+    if (con.sid) await consolePoll();
+  } catch (e) { /* retry next tick */ } finally { con.busy = false; }
+}
+async function consoleOpen(sid) {
+  con.sid = sid; con.after = 0;
+  $('conChat').innerHTML = '<div id="conHead"></div><div class="chat-log" id="conLog" aria-live="polite"></div><div id="conFoot"></div>';
+  await consolePoll(true);
+}
+async function consolePoll(first) {
+  const d = await api(`/api/chat/sessions/${con.sid}?after=${con.after}`);
+  const log = $('conLog'); if (!log) return;
+  d.messages.forEach((m) => { log.insertAdjacentHTML('beforeend', bubble(m)); con.after = Math.max(con.after, m.id); });
+  if (d.messages.length || first) log.scrollTop = log.scrollHeight;
+  $('conHead').innerHTML = `<div class="row between"><div><b>${esc(d.user)}</b> <span class="small muted">${esc(d.topic || '')}</span></div><span>${pill(d.status, d.status === 'active' ? 'good' : d.status === 'waiting' ? 'warn' : '')}</span></div>`;
+  const foot = $('conFoot');
+  const key = `${d.status}:${d.mine}`;
+  if (foot.dataset.key === key) return;
+  foot.dataset.key = key;
+  if (d.status === 'waiting') foot.innerHTML = `<button class="wide" data-action="con-claim" data-id="${d.id}">Take this chat</button>`;
+  else if (d.status === 'active' && d.mine) {
+    const agents = (await api('/api/chat/agents')).filter((a) => a.id !== me.id);
+    foot.innerHTML = `<form data-form="con-send" class="chat-send"><textarea name="body" rows="2" required maxlength="2000" placeholder="Reply" aria-label="Reply"></textarea><button type="submit" aria-label="Send">${icon('send')}</button></form>
+      <div class="row"><select id="conTo" aria-label="Hand over to">${agents.map((a) => `<option value="${a.id}">${esc(a.name)}${a.online ? ' (online)' : ''}</option>`).join('')}</select><button class="small ghost" data-action="con-transfer" ${agents.length ? '' : 'disabled'}>Hand over</button><button class="small ghost" data-action="con-close">End chat</button></div>`;
+  } else if (d.status === 'active') foot.innerHTML = `<p class="small muted">${esc(d.agent)} is handling this chat.</p>`;
+  else foot.innerHTML = `<p class="small muted">Chat ${esc(d.status)}${d.rating ? ` · rated ${d.rating}/5` : ''}.</p>`;
+}
+async function loadChatStats() {
+  const box = $('conStats'); if (!box) return;
+  try {
+    const a = await api('/api/chat/analytics');
+    const v = (x, suf = '') => (x == null ? '-' : x + suf);
+    box.innerHTML = `<h3>Chat statistics</h3><div class="grid">${[['Chats', a.chats], ['Answered', `${a.answered} (${v(a.answer_rate, '%')})`], ['Missed (became support requests)', a.missed], ['Average wait', a.average_wait_seconds == null ? '-' : wait(Math.round(a.average_wait_seconds))],
+      ['Average length', v(a.average_duration_minutes, ' min')], ['Average rating', a.average_rating == null ? '-' : `${a.average_rating}/5 (${a.ratings})`]].map(([l, x]) => `<div class="card kpi"><div class="muted">${l}</div><div class="stat">${x}</div></div>`).join('')}</div>
+      <div class="report-grid"><div class="card"><h4>By consultant</h4>${a.by_agent.length ? `<div class="table-wrap"><table class="table"><thead><tr><th>Consultant</th><th>Chats</th><th>Average wait</th><th>Rating</th></tr></thead><tbody>${a.by_agent.map((x) => `<tr><td>${esc(x.agent)}</td><td>${x.chats}</td><td>${x.average_wait_seconds == null ? '-' : wait(Math.round(x.average_wait_seconds))}</td><td>${v(x.average_rating)}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty">No chats yet.</div>'}</div>
+      <div class="card"><h4>Busiest hours (Botswana time)</h4>${barChart(a.by_hour)}</div></div>`;
+  } catch (e) { box.innerHTML = ''; }
+}
+document.addEventListener('keydown', (e) => {
+  const ta = e.target.closest('.chat-send textarea');
+  if (ta && e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ta.form.requestSubmit(); }
+});
+
 /* ---------- help, support, site content, application form ---------- */
 const telLink = (p) => String(p || '').split(' / ').map((x) => (/^[+\d][\d\s]+$/.test(x.trim()) ? `<a href="tel:${x.replace(/[^\d+]/g, '')}">${esc(x)}</a>` : esc(x))).join(' / ');
 function helpHTML(h, inPortal) {
@@ -645,6 +774,10 @@ async function pContent() {
     ${t('support_intro', 'Help page introduction', 3)}<div class="inline-form"><div class="field"><label>Support hours</label><input name="support_hours" maxlength="300" value="${esc(c.support_hours)}"></div>
     <div class="field"><label>Support email</label><input name="support_email" type="email" value="${esc(c.support_email)}"></div><div class="field"><label>Support phone</label><input name="support_phone" value="${esc(c.support_phone)}"></div></div>
     <div class="field"><label>Support categories and reply times</label><textarea name="support_categories" rows="6" class="mono">${esc(cats)}</textarea><div class="small muted">One per line: <code>key | label | working days to reply</code>. Use 0 for same day. Keys are short words like <code>account</code>.</div></div>
+    <h3>Live chat</h3><div class="inline-form"><div class="field"><label>Opens (Botswana time)</label><input name="chat_open" type="time" value="${esc(c.chat_open)}" required></div>
+    <div class="field"><label>Closes</label><input name="chat_close" type="time" value="${esc(c.chat_close)}" required></div></div>
+    ${t('chat_closed_dates', 'Public holidays when chat is closed (one date per line, like 2026-12-25)', 3)}${t('chat_away_message', 'Message shown when chat is closed', 3)}
+    <p class="small muted">Chat runs Monday to Friday. It opens only when at least one chat consultant has the Live chat page open; mark consultants on the Users page.</p>
     <button type="submit">Save content</button></form></div>
     <div class="card"><h2>Look and feel</h2><p class="muted">Set the portal name and colours to match the brand guide. White text must stay readable, so very light colours are refused.</p>
     <form data-form="theme"><div class="inline-form"><div class="field"><label>Portal name</label><input name="portal_name" required minlength="3" maxlength="80" value="${esc(c.portal_name)}"></div>
@@ -735,6 +868,19 @@ const actions = {
   'csv-breakdowns': async () => downloadCsv('/api/reports/breakdowns.csv?' + qs(reportFilter), `ceda-report-${new Date().toISOString().slice(0, 10)}.csv`),
   print: async () => window.print(),
   'theme-reset': async () => { await send('/api/admin/content', { theme_primary: '#1e5eff', theme_sidebar: '#10243f' }, 'PUT'); await loadSite(); toast('Default colours restored'); show('content'); },
+  'chat-toggle': async () => {
+    chat.open = !chat.open; $('chatPanel').classList.toggle('hidden', !chat.open);
+    document.querySelector('.chat-fab').setAttribute('aria-expanded', chat.open);
+    if (chat.open) await chatOpenPanel(); else { clearInterval(chat.timer); chat.sid = null; }
+  },
+  'chat-end': async () => { if (!confirm('End this chat?')) return; await api(`/api/chat/sessions/${chat.sid}/close`, { method: 'POST' }); await chatPoll(); },
+  'chat-new': async () => { chat.sid = null; await chatOpenPanel(); },
+  'chat-rate': async (t) => { await send(`/api/chat/sessions/${chat.sid}/rate`, { rating: Number(t.dataset.n) }); toast('Thank you'); const sid = chat.sid; await chatLoad(sid); },
+  'user-chat': async (t) => { await send(`/api/users/${t.dataset.id}`, { chat_agent: t.dataset.on !== '1' }, 'PATCH'); toast('Saved'); show('users'); },
+  'con-open': async (t) => { await consoleOpen(t.dataset.id); consoleTick(); },
+  'con-claim': async (t) => { await api(`/api/chat/sessions/${t.dataset.id}/claim`, { method: 'POST' }); $('conFoot').dataset.key = ''; await consolePoll(); consoleTick(); },
+  'con-transfer': async () => { await send(`/api/chat/sessions/${con.sid}/transfer`, { agent_id: Number($('conTo').value) }); toast('Handed over'); $('conFoot').dataset.key = ''; await consolePoll(); consoleTick(); },
+  'con-close': async () => { if (!confirm('End this chat?')) return; await api(`/api/chat/sessions/${con.sid}/close`, { method: 'POST' }); $('conFoot').dataset.key = ''; await consolePoll(); consoleTick(); loadChatStats(); },
   'faq-delete': async (t) => { if (!confirm('Delete this question for good?')) return; await api('/api/faqs/' + t.dataset.id, { method: 'DELETE' }); toast('Deleted'); show('content'); },
   'contact-delete': async (t) => { if (!confirm('Delete this contact for good?')) return; await api('/api/contacts/' + t.dataset.id, { method: 'DELETE' }); toast('Deleted'); show('content'); },
   'audit-verify': async () => { try { const j = await api('/api/audit/verify'); $('chain').textContent = j.ok ? `Chain intact (${j.checked} records)` : `TAMPERING DETECTED at record ${j.first_bad_id}`; $('chain').className = 'small ' + (j.ok ? '' : 'bad'); } catch (e) { toast(e.message); } },
@@ -789,6 +935,12 @@ const forms = {
   },
   'email-verify': async (f) => { await send('/api/me/email/verify', formData(f)); toast('Email address confirmed'); show('settings'); },
   'report-filter': async (f) => { const d = formData(f); reportFilter = { from: d.from || '', to: d.to || '', programme_id: d.programme_id || '' }; show('reports'); },
+  'chat-start': async (f) => {
+    try { const d = await send('/api/chat/sessions', formData(f)); await chatLoad(d.id); } catch (e) { if (e.data && e.data.detail && e.data.detail.away) await chatOpenPanel(); else throw e; }
+  },
+  'chat-send': async (f) => { const d = formData(f); f.reset(); await send(`/api/chat/sessions/${chat.sid}/messages`, d); await chatPoll(); },
+  'chat-leave': async (f) => { const j = await send('/api/chat/leave-message', formData(f)); $('chatBody').innerHTML = `<div class="chat-away"><p><b>Message sent.</b> We will reply by ${esc(when(j.due_at))}. You will find the reply on the Support page.</p></div>`; },
+  'con-send': async (f) => { const d = formData(f); f.reset(); await send(`/api/chat/sessions/${con.sid}/messages`, d); await consolePoll(); },
   ticket: async (f) => { await send('/api/support/tickets', formData(f)); toast('Sent. We will reply within the time shown.'); show('support'); },
   'ticket-reply': async (f) => { await send(`/api/support/tickets/${f.dataset.id}/reply`, formData(f)); toast('Reply sent'); show('support'); },
   content: async (f) => {
