@@ -229,3 +229,4 @@ h1,h2,h3{color:var(--navy)}
 @media (max-width:860px){.console{grid-template-columns:1fr}.console-chat{height:auto;min-height:60vh}}
 @media (max-width:640px){.chat-panel{right:8px;left:8px;width:auto;bottom:74px;height:calc(100vh - 96px)}.chat-fab{right:12px;bottom:12px}}
 @media print{#chatDock{display:none}}
+#conFoot .row select{width:auto;flex:1;min-width:0}
