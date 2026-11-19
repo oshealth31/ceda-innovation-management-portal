@@ -484,7 +484,7 @@ function barChart(items, opts = {}) {
   // Horizontal bars drawn as plain HTML so they stay sharp, readable and accessible on any screen.
   if (!items.length) return '<div class="empty">No data yet.</div>';
   const max = Math.max(...items.map((x) => x.count), 1);
-  return `<div class="bars" role="list">${items.map((x) => {
+  return `<div class="bars${opts.outcomes ? ' outcomes' : ''}" role="list">${items.map((x) => {
     const w = (x.count / max) * 100; const ap = x.approved ? (x.approved / x.count) * w : 0; const de = x.declined ? (x.declined / x.count) * w : 0;
     const rate = x.approval_rate == null ? '' : ` · ${x.approval_rate}% approved`;
     return `<div class="bar-row" role="listitem" title="${esc(x.label)}: ${x.count} ideas${x.approved != null ? `, ${x.approved} approved, ${x.declined} declined` : ''}">
@@ -493,10 +493,11 @@ function barChart(items, opts = {}) {
       <div class="bar-num">${x.count}<span class="small muted">${opts.outcomes ? rate : ''}</span></div></div>`;
   }).join('')}</div>`;
 }
+const monthLabel = (ym) => { const [y, m] = ym.split('-').map(Number); return new Date(y, m - 1, 1).toLocaleDateString(undefined, { month: 'short', year: '2-digit' }); };
 function columnChart(items) {
   if (!items.length) return '<div class="empty">No data yet.</div>';
   const max = Math.max(...items.map((x) => x.count), 1);
-  return `<div class="cols">${items.map((x) => `<div class="col" title="${esc(x.label)}: ${x.count}"><span class="col-num">${x.count}</span><div class="col-bar" style="height:${Math.max(4, (x.count / max) * 120)}px"></div><span class="col-label">${esc(x.label.slice(2))}</span></div>`).join('')}</div>`;
+  return `<div class="cols">${items.map((x) => `<div class="col" title="${esc(x.label)}: ${x.count}"><span class="col-num">${x.count}</span><div class="col-bar" style="height:${Math.max(4, (x.count / max) * 120)}px"></div><span class="col-label">${esc(monthLabel(x.label))}</span></div>`).join('')}</div>`;
 }
 async function downloadCsv(path, name) {
   try {
