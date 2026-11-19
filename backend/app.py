@@ -155,6 +155,10 @@ class User(Base):
     otp_login: Mapped[bool] = mapped_column(Boolean, default=False)       # ask for an emailed code at every sign-in
     alert_email: Mapped[bool] = mapped_column(Boolean, default=True)
     alert_sms: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Optional, only used for anonymous statistics in reports (1.6)
+    gender: Mapped[str] = mapped_column(String(20), default='')
+    birth_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    district: Mapped[str] = mapped_column(String(80), default='')
 
 
 class OneTimeCode(Base):
@@ -509,7 +513,30 @@ USER_COLUMNS_14 = {  # added in 1.4; existing databases get them in place, with 
     'full_name': ("VARCHAR(200) DEFAULT ''", None), 'email': ('VARCHAR(200)', None), 'phone': ('VARCHAR(40)', None),
     'email_verified': ('BOOLEAN', True), 'pending_email': ('VARCHAR(200)', None), 'otp_login': ('BOOLEAN', False),
     'alert_email': ('BOOLEAN', True), 'alert_sms': ('BOOLEAN', False),
+    'gender': ("VARCHAR(20) DEFAULT ''", None), 'birth_year': ('INTEGER', None), 'district': ("VARCHAR(80) DEFAULT ''", None),
 }
+GENDERS = ('female', 'male', 'other', 'prefer_not')
+DISTRICTS = ('Gaborone', 'Francistown', 'Lobatse', 'Selebi-Phikwe', 'Jwaneng', 'Orapa', 'Sowa Town', 'Central', 'Chobe',
+             'Ghanzi', 'Kgalagadi', 'Kgatleng', 'Kweneng', 'North-East', 'North-West', 'South-East', 'Southern')
+
+
+def clean_profile(gender, birth_year, district) -> dict:
+    """Validate the optional statistics fields. Empty values mean 'not stated'."""
+    out = {}
+    if gender is not None:
+        if gender not in ('',) + GENDERS:
+            raise HTTPException(422, 'Gender must be one of: female, male, other, prefer not to say.')
+        out['gender'] = gender
+    if birth_year is not None:
+        this_year = utcnow().year
+        if birth_year and not (this_year - 100 <= birth_year <= this_year - 16):
+            raise HTTPException(422, 'Please enter a real year of birth.')
+        out['birth_year'] = birth_year or None
+    if district is not None:
+        if district not in ('',) + DISTRICTS:
+            raise HTTPException(422, 'Please choose a district from the list.')
+        out['district'] = district
+    return out
 
 
 def add_missing_columns(table: str, columns: dict):
@@ -859,6 +886,9 @@ class RegisterRequest(BaseModel):
     phone: str = Field(default='', max_length=40)
     password: str = Field(max_length=200)
     accept_privacy: bool
+    gender: str = Field(default='', max_length=20)
+    birth_year: int | None = None
+    district: str = Field(default='', max_length=80)
 
 
 class CodeRequest(BaseModel):
@@ -883,6 +913,9 @@ class PreferencesUpdate(BaseModel):
     alert_email: bool | None = None
     alert_sms: bool | None = None
     otp_login: bool | None = None
+    gender: str | None = Field(default=None, max_length=20)
+    birth_year: int | None = None
+    district: str | None = Field(default=None, max_length=80)
 
 
 class EmailCode(BaseModel):
@@ -1419,7 +1452,8 @@ def register(req: RegisterRequest, request: Request, s: Session = Depends(db)):
         raise HTTPException(409, 'An account with that email address already exists. Try signing in, or reset your password.')
     inst = default_institution(s)
     u = User(username=req.username, password_hash=hash_password(req.password), role='applicant', institution_id=inst.id,
-             full_name=req.full_name.strip(), email=email, phone=phone or None, email_verified=False)
+             full_name=req.full_name.strip(), email=email, phone=phone or None, email_verified=False,
+             **clean_profile(req.gender, req.birth_year, req.district))
     s.add(u)
     s.flush()
     audit(s, inst.id, u.id, 'register', 'user', u.id, json.dumps({'username': u.username}))
@@ -1508,7 +1542,8 @@ def login_with_code(req: CodeRequest, request: Request, s: Session = Depends(db)
 @app.get('/api/auth/options')
 def auth_options():
     """What the sign-in page may offer."""
-    return {'self_registration': SELF_REGISTRATION, 'email': MSG.email_channel() != 'log', 'sms': MSG.sms_channel() != 'log'}
+    return {'self_registration': SELF_REGISTRATION, 'email': MSG.email_channel() != 'log', 'sms': MSG.sms_channel() != 'log',
+            'genders': list(GENDERS), 'districts': list(DISTRICTS)}
 
 
 @app.get('/api/me')
@@ -1521,7 +1556,8 @@ def me(u: User = Depends(current_user), s: Session = Depends(db)):
 def prefs_dict(u: User) -> dict:
     return {'full_name': u.full_name, 'email': u.email, 'phone': u.phone, 'email_verified': u.email_verified,
             'pending_email': u.pending_email, 'alert_email': u.alert_email, 'alert_sms': u.alert_sms,
-            'otp_login': u.otp_login, 'channels': {'email': MSG.email_channel() != 'log', 'sms': MSG.sms_channel() != 'log'}}
+            'otp_login': u.otp_login, 'gender': u.gender, 'birth_year': u.birth_year, 'district': u.district,
+            'genders': list(GENDERS), 'districts': list(DISTRICTS), 'channels': {'email': MSG.email_channel() != 'log', 'sms': MSG.sms_channel() != 'log'}}
 
 
 @app.get('/api/me/preferences')
@@ -1557,8 +1593,13 @@ def set_preferences(req: PreferencesUpdate, u: User = Depends(current_user), s: 
         if req.otp_login and not (u.email and u.email_verified):
             raise HTTPException(422, 'Confirm an email address first: the sign-in code is sent there.')
         u.otp_login = req.otp_login
+    fields = req.model_fields_set
+    for k, v in clean_profile(req.gender, req.birth_year if 'birth_year' in fields else None, req.district).items():
+        setattr(u, k, v)
+    if 'birth_year' in fields and req.birth_year is None:
+        u.birth_year = None
     audit(s, u.institution_id, u.id, 'update_preferences', 'user', u.id,
-          json.dumps({k: v for k, v in req.model_dump().items() if v is not None and k not in ('email', 'phone')}))
+          json.dumps({k: v for k, v in req.model_dump().items() if v is not None and k not in ('email', 'phone', 'gender', 'birth_year', 'district')}))
     s.commit()
     return {**prefs_dict(u), **out}
 
@@ -3009,6 +3050,11 @@ def pilot_summary(u: User = Depends(require_roles(*STAFF)), s: Session = Depends
                               'decision_coverage_rate': pct(decided, n)},
             'human_decision_required': True}
 
+
+# Feature modules. Imported here, after the models and helpers they use are defined.
+from . import reports  # noqa: E402
+
+app.include_router(reports.router)
 
 # Static frontend is mounted last so /api/* routes take precedence.
 app.mount('/', StaticFiles(directory=ROOT / 'frontend', html=True), name='frontend')

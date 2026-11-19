@@ -2,6 +2,14 @@
 
 Version number lives in one place: the `VERSION` file. `backend/app.py` reads it; `/api/health`, reports and the Docker image all follow.
 
+## 1.6.0 - 2026-11-19
+Reports module (`backend/reports.py`).
+- **Reports page** for administrators, evaluators and adjudicators: ideas, approval rate, youth and women's share, funding requested; ideas per month; where ideas are now; and breakdowns by sector, stage, gender, age group, district and call, each showing approved and declined.
+- **How long each step takes**: average days from submission to first review, in evaluation, with adjudicators and to decision, plus ideas waiting more than 30 days and the share sent back for more information.
+- **Spreadsheet downloads**: every idea as one row (with answers to the extra form questions), and the summary tables. Text that looks like a formula is neutralised so it cannot run in Excel.
+- Filters by date range and call, and a print layout.
+- **Optional profile details** at sign-up and in Settings: gender, year of birth and district, used only as totals in reports.
+
 ## 1.5.0 - 2026-11-13
 Help, support and content management. Existing databases are upgraded on start-up (new tables, and one new column on ideas).
 - **Help and FAQs**: questions and answers grouped by topic, plus a directory of regulators and partners (CEDA, CIPA, BOBS, BOCRA, CCA, BURS, NBFIRA). Open to everyone from the sign-in page, without an account. Contact details were checked against the organisations' published notices on 13 November 2026.

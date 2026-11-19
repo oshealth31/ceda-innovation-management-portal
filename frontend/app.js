@@ -43,6 +43,7 @@ const NAV = [
   ['programmes', 'Calls / programmes', ['admin', 'officer', 'committee']],
   ['knowledge', 'Policy Knowledge', ['admin', 'officer', 'committee']],
   ['management', 'Management Dashboard', ['admin', 'officer', 'committee']],
+  ['reports', 'Reports', ['admin', 'officer', 'committee']],
   ['notifications', 'Notifications', ['admin', 'officer', 'committee', 'applicant']],
   ['support', 'Support', ['admin', 'officer', 'committee', 'applicant']],
   ['help', 'Help and FAQs', ['admin', 'officer', 'committee', 'applicant']],
@@ -119,7 +120,7 @@ async function show(id) {
   setMenu(false);
   $('page').innerHTML = '<div class="empty">Loading...</div>';
   try { await ({ dashboard: pDashboard, applications: pApplications, new: pNew, review: pReview, committee: pCommittee, scoring: pScoring, standards: pStandards,
-    programmes: pProgrammes, knowledge: pKnowledge, management: pManagement, notifications: pNotifications, users: pUsers, audit: pAudit, messages: pMessages, settings: pSettings, support: pSupport, help: pHelp, content: pContent, formbuilder: pFormBuilder }[id])(); }
+    programmes: pProgrammes, knowledge: pKnowledge, management: pManagement, reports: pReports, notifications: pNotifications, users: pUsers, audit: pAudit, messages: pMessages, settings: pSettings, support: pSupport, help: pHelp, content: pContent, formbuilder: pFormBuilder }[id])(); }
   catch (e) { $('page').innerHTML = `<div class="card bad">${esc(e.message)}</div>`; }
 }
 
@@ -452,6 +453,7 @@ async function pSettings() {
       <label><input id="aiToggle" type="checkbox" data-change="ai" ${i.ai_enabled ? 'checked' : ''}> Allow AI assistance for ${esc(i.name)}</label></div>`;
   }
   const p = await api('/api/me/preferences');
+  if (p.districts) authOpts = { genders: p.genders, districts: p.districts };
   const off = (on) => (on ? '' : ' <span class="small muted">(not set up on this server yet: messages are recorded in the log only)</span>');
   const contact = `<div class="card"><h3>Contact details and alerts</h3>
     <form data-form="prefs"><div class="inline-form"><div class="field"><label>Full name</label><input name="full_name" value="${esc(p.full_name || '')}" maxlength="200"></div>
@@ -461,10 +463,75 @@ async function pSettings() {
     <label><input type="checkbox" name="alert_email" ${p.alert_email ? 'checked' : ''}> Email me alerts${off(p.channels.email)}</label><br>
     <label><input type="checkbox" name="alert_sms" ${p.alert_sms ? 'checked' : ''}> SMS me alerts${off(p.channels.sms)}</label><br>
     <label><input type="checkbox" name="otp_login" ${p.otp_login ? 'checked' : ''}> Ask for a one-time code from my email each time I sign in</label>
+    ${me.role === 'applicant' ? `<h4>About you (optional)</h4>${profileFields(p)}` : ''}
     <div><button type="submit">Save</button></div></form>
     ${p.pending_email ? `<form data-form="email-verify" class="inline-form"><div class="field"><label>Code sent to ${esc(p.pending_email)}</label><input name="code" inputmode="numeric" maxlength="6" required class="code-input"></div><button type="submit">Confirm new email</button></form>` : ''}</div>`;
   $('page').innerHTML = `${ai}${contact}<div class="card"><h3>Change password</h3><form data-form="pw"><div class="inline-form"><div class="field"><label>Current password</label><input name="current_password" type="password" required autocomplete="current-password"></div>
     <div class="field"><label>New password (min 12)</label><input name="new_password" type="password" required minlength="12" autocomplete="new-password"></div></div><button type="submit">Change password</button></form></div>`;
+}
+
+/* ---------- icons (simple line icons, drawn here so nothing loads from outside) ---------- */
+const ICONS = {
+  download: '<path d="M12 4v11"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/>',
+  print: '<path d="M7 9V4h10v5"/><rect x="4" y="9" width="16" height="8" rx="2"/><path d="M7 14h10v6H7z"/>',
+};
+const icon = (name) => (ICONS[name] ? `<svg class="ico" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>` : '');
+
+/* ---------- reports ---------- */
+let reportFilter = { from: '', to: '', programme_id: '' };
+const qs = (o) => new URLSearchParams(Object.entries(o).filter(([, v]) => v)).toString();
+function barChart(items, opts = {}) {
+  // Horizontal bars drawn as plain HTML so they stay sharp, readable and accessible on any screen.
+  if (!items.length) return '<div class="empty">No data yet.</div>';
+  const max = Math.max(...items.map((x) => x.count), 1);
+  return `<div class="bars" role="list">${items.map((x) => {
+    const w = (x.count / max) * 100; const ap = x.approved ? (x.approved / x.count) * w : 0; const de = x.declined ? (x.declined / x.count) * w : 0;
+    const rate = x.approval_rate == null ? '' : ` · ${x.approval_rate}% approved`;
+    return `<div class="bar-row" role="listitem" title="${esc(x.label)}: ${x.count} ideas${x.approved != null ? `, ${x.approved} approved, ${x.declined} declined` : ''}">
+      <div class="bar-label">${esc(x.label)}</div>
+      <div class="bar-track"><div class="bar-fill" style="width:${w}%">${opts.outcomes ? `<span class="bar-ok" style="width:${(ap / w) * 100 || 0}%"></span><span class="bar-no" style="width:${(de / w) * 100 || 0}%"></span>` : ''}</div></div>
+      <div class="bar-num">${x.count}<span class="small muted">${opts.outcomes ? rate : ''}</span></div></div>`;
+  }).join('')}</div>`;
+}
+function columnChart(items) {
+  if (!items.length) return '<div class="empty">No data yet.</div>';
+  const max = Math.max(...items.map((x) => x.count), 1);
+  return `<div class="cols">${items.map((x) => `<div class="col" title="${esc(x.label)}: ${x.count}"><span class="col-num">${x.count}</span><div class="col-bar" style="height:${Math.max(4, (x.count / max) * 120)}px"></div><span class="col-label">${esc(x.label.slice(2))}</span></div>`).join('')}</div>`;
+}
+async function downloadCsv(path, name) {
+  try {
+    const r = await fetch(path, { headers: { Authorization: 'Bearer ' + token } });
+    if (!r.ok) { let j = null; try { j = await r.json(); } catch (e) { /* ignore */ } throw new Error(errText(j, r.status)); }
+    const url = URL.createObjectURL(await r.blob());
+    const a = document.createElement('a'); a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  } catch (e) { toast(e.message); }
+}
+async function pReports() {
+  const [d, progs] = await Promise.all([api('/api/reports/summary?' + qs(reportFilter)), api('/api/programmes')]);
+  const t = d.totals; const tm = d.timing_days;
+  const days = (v) => (v == null ? '-' : `${v} day${v === 1 ? '' : 's'}`);
+  const pc = (v) => (v == null ? '-' : v + '%');
+  const kpi = (label, value, note) => `<div class="card kpi"><div class="muted">${label}</div><div class="stat">${value}</div>${note ? `<div class="small muted">${note}</div>` : ''}</div>`;
+  const legend = '<div class="legend small"><span><i class="bar-ok"></i>Approved</span><span><i class="bar-no"></i>Declined</span><span><i class="bar-rest"></i>Other</span></div>';
+  const chartCard = (title, items, outcomes = true) => `<div class="card"><h3>${title}</h3>${outcomes ? legend : ''}${barChart(items, { outcomes })}</div>`;
+  $('page').innerHTML = `<div class="card"><div class="row between"><h2>Reports</h2><div class="row">
+      <button class="ghost small" data-action="csv-ideas">${icon('download')} Ideas spreadsheet</button>
+      <button class="ghost small" data-action="csv-breakdowns">${icon('download')} Summary spreadsheet</button>
+      <button class="ghost small" data-action="print">${icon('print')} Print</button></div></div>
+    <form data-form="report-filter" class="inline-form"><div class="field"><label>From</label><input type="date" name="from" value="${esc(reportFilter.from)}"></div>
+      <div class="field"><label>To</label><input type="date" name="to" value="${esc(reportFilter.to)}"></div>
+      <div class="field"><label>Call / programme</label><select name="programme_id"><option value="">All</option>${progs.map((p) => `<option value="${esc(p.id)}" ${reportFilter.programme_id === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></div>
+      <div class="field"><label>&nbsp;</label><button type="submit">Apply</button></div></form>
+    <p class="small muted">Counts are by the date an idea was created. Gender, age and district come from what submitters chose to share; "Not stated" means they left it blank.</p></div>
+    <div class="grid">${kpi('Ideas', t.ideas, `${t.submitted} submitted · ${t.drafts} drafts`)}${kpi('In review', t.in_progress)}${kpi('Approved', t.approved, `${t.declined} declined`)}${kpi('Approval rate', pc(t.approval_rate), 'of decided ideas')}</div>
+    <div class="grid">${kpi('Youth (18-35)', pc(t.youth_share), 'of submitters who gave their age')}${kpi('Women', pc(t.women_share), 'of submitters who gave their gender')}${kpi('Funding requested', money(t.funding_requested), `${money(t.funding_requested_approved)} in approved ideas`)}${kpi('Average score', d.average_score == null ? '-' : d.average_score, 'from evaluators')}</div>
+    <div class="card"><h3>How long each step takes (average)</h3><div class="grid">${kpi('Submitted to first review', days(tm.to_first_review))}${kpi('In evaluation', days(tm.in_evaluation))}${kpi('With adjudicators', days(tm.in_adjudication))}${kpi('Submitted to decision', days(tm.to_decision))}</div>
+      <p class="small">${tm.waiting_over_30_days ? `<b class="bad">${tm.waiting_over_30_days} idea(s) waiting more than 30 days.</b> ` : ''}Sent back for more information at least once: ${pc(d.sent_back_share)} of submitted ideas. Support requests answered on time: ${pc(d.support.answered_on_time_pct)} (${d.support.open} open).</p></div>
+    <div class="card"><h3>Ideas created per month</h3>${columnChart(d.by_month)}</div>
+    <div class="card"><h3>Where ideas are now</h3>${barChart(d.by_status)}</div>
+    <div class="report-grid">${chartCard('By sector', d.by_sector)}${chartCard('By stage', d.by_stage)}${chartCard('By gender', d.by_gender)}${chartCard('By age group', d.by_age)}${chartCard('By district', d.by_district)}${chartCard('By call / programme', d.by_programme)}</div>
+    <p class="small muted">Generated ${esc(when(d.generated_at))}.</p>`;
 }
 
 /* ---------- help, support, site content, application form ---------- */
@@ -611,6 +678,9 @@ const actions = {
   },
   'notif-read': async (t) => { try { await api(`/api/notifications/${t.dataset.id}/read`, { method: 'POST' }); show('notifications'); } catch (e) { toast(e.message); } },
   'ticket-close': async (t) => { if (!confirm('Close this request?')) return; await api(`/api/support/tickets/${t.dataset.id}/close`, { method: 'POST' }); toast('Closed'); show('support'); },
+  'csv-ideas': async () => downloadCsv('/api/reports/ideas.csv?' + qs(reportFilter), `ceda-ideas-${new Date().toISOString().slice(0, 10)}.csv`),
+  'csv-breakdowns': async () => downloadCsv('/api/reports/breakdowns.csv?' + qs(reportFilter), `ceda-report-${new Date().toISOString().slice(0, 10)}.csv`),
+  print: async () => window.print(),
   'faq-delete': async (t) => { if (!confirm('Delete this question for good?')) return; await api('/api/faqs/' + t.dataset.id, { method: 'DELETE' }); toast('Deleted'); show('content'); },
   'contact-delete': async (t) => { if (!confirm('Delete this contact for good?')) return; await api('/api/contacts/' + t.dataset.id, { method: 'DELETE' }); toast('Deleted'); show('content'); },
   'audit-verify': async () => { try { const j = await api('/api/audit/verify'); $('chain').textContent = j.ok ? `Chain intact (${j.checked} records)` : `TAMPERING DETECTED at record ${j.first_bad_id}`; $('chain').className = 'small ' + (j.ok ? '' : 'bad'); } catch (e) { toast(e.message); } },
@@ -658,10 +728,13 @@ const forms = {
   'user-create': async (f) => { await send('/api/users', formData(f)); toast('User created'); show('users'); },
   prefs: async (f) => {
     const d = formData(f);
-    const j = await send('/api/me/preferences', { full_name: d.full_name, email: d.email, phone: d.phone, alert_email: !!d.alert_email, alert_sms: !!d.alert_sms, otp_login: !!d.otp_login }, 'PUT');
+    const body = { full_name: d.full_name, email: d.email, phone: d.phone, alert_email: !!d.alert_email, alert_sms: !!d.alert_sms, otp_login: !!d.otp_login };
+    if ('gender' in d) Object.assign(body, { gender: d.gender, district: d.district, birth_year: d.birth_year ? Number(d.birth_year) : null });
+    const j = await send('/api/me/preferences', body, 'PUT');
     toast(j.sent_to ? `Saved. We sent a code to ${j.sent_to} to confirm the new address.${j.demo_code ? ' Demo code: ' + j.demo_code : ''}` : 'Saved'); show('settings');
   },
   'email-verify': async (f) => { await send('/api/me/email/verify', formData(f)); toast('Email address confirmed'); show('settings'); },
+  'report-filter': async (f) => { const d = formData(f); reportFilter = { from: d.from || '', to: d.to || '', programme_id: d.programme_id || '' }; show('reports'); },
   ticket: async (f) => { await send('/api/support/tickets', formData(f)); toast('Sent. We will reply within the time shown.'); show('support'); },
   'ticket-reply': async (f) => { await send(`/api/support/tickets/${f.dataset.id}/reply`, formData(f)); toast('Reply sent'); show('support'); },
   content: async (f) => {
@@ -702,6 +775,12 @@ document.addEventListener('submit', (e) => {
 });
 /* ---------- sign-in, sign-up, codes ---------- */
 const auth = { who: '' };
+let authOpts = { genders: ['female', 'male', 'other', 'prefer_not'], districts: [] };
+const GENDER_TEXT = { female: 'Female', male: 'Male', other: 'Other', prefer_not: 'Prefer not to say' };
+const profileFields = (p = {}) => `<div class="inline-form"><div class="field"><label>Gender</label><select name="gender"><option value="">Not stated</option>${authOpts.genders.map((g) => `<option value="${g}" ${p.gender === g ? 'selected' : ''}>${GENDER_TEXT[g] || g}</option>`).join('')}</select></div>
+  <div class="field"><label>Year of birth</label><input name="birth_year" type="number" inputmode="numeric" min="1926" max="2010" value="${esc(p.birth_year || '')}"></div>
+  <div class="field"><label>District</label><select name="district"><option value="">Not stated</option>${authOpts.districts.map((x) => `<option ${p.district === x ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select></div></div>
+  <p class="small muted">Optional. Used only as totals in CEDA's reports (for example, how many ideas come from young people or from each district). Never shown next to your name.</p>`;
 const authMsg = (ok, text) => {
   $('loginError').classList.add('hidden'); $('loginOk').classList.add('hidden');
   if (text) { const el = ok ? $('loginOk') : $('loginError'); el.innerHTML = text; el.classList.remove('hidden'); }
@@ -716,6 +795,7 @@ const AUTH_VIEWS = {
     <div class="field"><label>Email</label><input name="email" type="email" required autocomplete="email"></div>
     <div class="field"><label>Mobile number (optional, for SMS alerts)</label><input name="phone" type="tel" placeholder="71 234 567" autocomplete="tel"></div>
     <div class="field"><label>Password (at least 12 characters)</label><input name="password" type="password" required minlength="12" autocomplete="new-password"></div>
+    <details class="faq"><summary>About you (optional)</summary>${profileFields()}</details>
     <label class="small"><input type="checkbox" name="accept_privacy" required> I agree that CEDA may use these details to process my idea and contact me about it.</label>
     <button class="wide" type="submit">Create account</button></form>${back}`,
   verify: () => `<h3>Confirm your email</h3><form data-auth-form="verify">${codeField('Code from the email')}<button class="wide" type="submit">Confirm and sign in</button></form>
@@ -742,7 +822,7 @@ async function authPost(path, body) {
   return d;
 }
 const AUTH_FORMS = {
-  register: async (d) => { const j = await authPost('/api/auth/register', { ...d, accept_privacy: !!d.accept_privacy }); auth.who = j.username; authView('verify', sentLine(j, 'Account created.')); },
+  register: async (d) => { const j = await authPost('/api/auth/register', { ...d, birth_year: d.birth_year ? Number(d.birth_year) : null, accept_privacy: !!d.accept_privacy }); auth.who = j.username; authView('verify', sentLine(j, 'Account created.')); },
   verify: async (d) => signedIn(await authPost('/api/auth/verify', { identifier: auth.who, code: d.code })),
   forgot: async (d) => { auth.who = d.identifier.trim(); const j = await authPost('/api/auth/forgot', { identifier: auth.who }); authView('reset', sentLine(j, 'If that account exists, a reset code is on its way.')); },
   reset: async (d) => { await authPost('/api/auth/reset', { identifier: auth.who, code: d.code, new_password: d.new_password }); $('username').value = auth.who; authView('signin', 'Password changed. Please sign in with your new password.'); },
@@ -779,5 +859,5 @@ $('loginForm').addEventListener('submit', async (e) => {
     signedIn(d);
   } catch (ex) { authMsg(false, esc(ex.message)); }
 });
-fetch('/api/auth/options').then((r) => r.json()).then((o) => { if (!o.self_registration) $('regLink').classList.add('hidden'); }).catch(() => {});
+fetch('/api/auth/options').then((r) => r.json()).then((o) => { if (o.districts) authOpts = o; if (!o.self_registration) $('regLink').classList.add('hidden'); }).catch(() => {});
 boot();

@@ -652,6 +652,48 @@ class ApiScenario(unittest.TestCase):
         self.assertEqual(self.c.post(f"/api/support/tickets/{t['id']}/close", headers=h).json()['status'], 'closed')
         self.assertEqual(M.add_working_days(M.datetime(2026, 11, 13, 10), 1).day, 16)  # Friday + 1 working day = Monday
 
+    # ---- 31 reports: breakdowns, timings and spreadsheet downloads
+    def test_31_reports(self):
+        h, ad, o = self.ids['neo'], self.ids['admin'], self.ids['officer']
+        self.assertEqual(self.c.put('/api/me/preferences', headers=h, json={'gender': 'robot'}).status_code, 422)
+        self.assertEqual(self.c.put('/api/me/preferences', headers=h, json={'birth_year': 1800}).status_code, 422)
+        self.assertEqual(self.c.put('/api/me/preferences', headers=h, json={'district': 'Atlantis'}).status_code, 422)
+        r = self.c.put('/api/me/preferences', headers=h, json={'gender': 'female', 'birth_year': M.utcnow().year - 26, 'district': 'North-West'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual((r.json()['gender'], r.json()['district']), ('female', 'North-West'))
+        idea = {**IDEA, 'idea_title': '=HYPERLINK("http://x")'}
+        app_id = self.c.post('/api/applications', headers=h, json={'applicant_name': 'Neo Labs', 'funding_request': 5000,
+                                                                    'owner_contribution': 0, **idea}).json()['id']
+        self.assertEqual(self.upload(h, app_id).status_code, 200)
+        self.assign(app_id, 'officer1')
+        self.assertEqual(self.decide(o, 'refer_committee', 'Strong idea, refer.', app_id=app_id).status_code, 200)
+        self.assertEqual(self.decide(self.ids['committee'], 'approve', 'Approved for support.', app_id=app_id).status_code, 200)
+        self.assertEqual(self.c.get('/api/reports/summary', headers=h).status_code, 403)
+        d = self.c.get('/api/reports/summary', headers=ad).json()
+        self.assertGreaterEqual(d['totals']['ideas'], 3)
+        self.assertGreaterEqual(d['totals']['approved'], 1)
+        female = next(x for x in d['by_gender'] if x['label'] == 'Female')
+        self.assertGreaterEqual(female['approved'], 1)
+        self.assertIn('25-29', [x['label'] for x in d['by_age']])
+        self.assertIn('North-West', [x['label'] for x in d['by_district']])
+        self.assertEqual(d['by_gender'][-1]['label'], 'Not stated')  # staff-entered ideas have no submitter profile
+        self.assertIsNotNone(d['timing_days']['to_decision'])
+        self.assertEqual(self.c.get('/api/reports/summary?from=2999-01-01', headers=ad).json()['totals']['ideas'], 0)
+        self.assertEqual(self.c.get('/api/reports/summary?from=yesterday', headers=ad).status_code, 422)
+        r = self.c.get('/api/reports/ideas.csv', headers=o)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('text/csv', r.headers['content-type'])
+        text = r.content.decode('utf-8-sig')
+        self.assertTrue(text.startswith('Idea,Submitter,'))
+        self.assertIn('District', text.splitlines()[0])  # extra form question column
+        self.assertIn("'=HYPERLINK", text)  # formulas are neutralised
+        self.assertNotIn('\n=HYPERLINK', text)
+        r = self.c.get('/api/reports/breakdowns.csv', headers=ad)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('Gender,Ideas,Approved,Declined', r.content.decode('utf-8-sig'))
+        self.assertEqual(M.reports.age_band(2000, __import__('datetime').date(2026, 6, 1)), '25-29')
+        self.assertEqual(M.reports.age_band(None), 'Not stated')
+
 
 if __name__ == '__main__':
     unittest.main()
